@@ -8,6 +8,9 @@ import (
 // Retry runs fn up to attempts times with exponential backoff starting at
 // base. It stops early when ctx is done and returns the last error.
 func Retry(ctx context.Context, attempts int, base time.Duration, fn func(context.Context) error) error {
+	if attempts <= 0 {
+		return nil
+	}
 	var err error
 	wait := base
 	for i := 0; i < attempts; i++ {

@@ -28,7 +28,7 @@ One recipe covers both endpoints; a change to the recipe applies to both.
 | `max_output_tokens` | verbatim when present |
 | `stream:true` | SSE relay: `event:` lines preserved, envelope rewritten in `response` objects, output items byte-identical, single proxy-emitted `response.completed` |
 | `stream:false` | proxy calls upstream `stream:true`, waits for `response.completed`, returns the response object with envelope rewritten |
-| response envelope | `id` (proxy-generated `resp-` form), `model`, `created_at` rewritten; `object`, `status`, `output[]` and all other fields pass through |
+| response envelope | `id` (proxy-generated `resp_` + 26 base62), `model`, `created_at` rewritten; `object`, `status`, `output[]` and all other fields pass through |
 
 ## SSE event types
 

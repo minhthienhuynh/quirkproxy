@@ -26,16 +26,16 @@ data age in seconds.
 | `capabilities.modalities` | models.dev `modalities.input/output` |
 | `capabilities` interleaved | models.dev `interleaved` (string or `{"field": ...}`; absent → field omitted) |
 | `variants` | models.dev `reasoning_options`: effort → values verbatim; toggle → low/medium/high; budget_tokens → high/max; empty/absent → `{}` |
-| `quirk.status` | `"active"` after filtering (deprecated/alpha already dropped) |
+| `quirk.status` | `"active"` after filtering (deprecated already dropped; alpha kept like CLI) |
 | `quirk.family` | models.dev `family` |
 | `quirk.transport` | `model.provider.npm ?? provider.npm ?? "@ai-sdk/openai-compatible"` (per CLI) |
 | `quirk.endpoint` | `"responses"` when transport is `@ai-sdk/openai`, otherwise `"chat/completions"` (Zen-specific; other providers define their own) |
 
 ## Filtering (CLI mirror, fail-closed)
 
-`cost.input == 0` → drop `deprecated`/`alpha` (except experimental) →
+`cost.input == 0` (null cost = free) → drop `deprecated` only →
 intersect Zen catalog (absent → drop + log) → blacklist/whitelist.
-Models missing `cost` in models.dev are dropped + logged.
+Models missing `cost` in models.dev are treated as free (`cost.input = 0`).
 Every dropped model logs exactly one line with its filter step.
 Duplicate ids across providers: keep the lowest provider id (sorted), drop the rest + WARN log.
 

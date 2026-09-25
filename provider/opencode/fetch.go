@@ -14,18 +14,6 @@ type zenEntry struct {
 	Created int64
 }
 
-func (z *zenEntry) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		ID      string `json:"id"`
-		Created int64  `json:"created"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	z.ID, z.Created = raw.ID, raw.Created
-	return nil
-}
-
 // fetchZenCatalog GETs the public Zen model catalog. Items without an id
 // are skipped instead of failing the whole listing.
 func fetchZenCatalog(ctx context.Context, client *http.Client, url string) (map[string]zenEntry, error) {

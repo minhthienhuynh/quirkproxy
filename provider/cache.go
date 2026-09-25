@@ -58,7 +58,7 @@ func (r *Refresher[T]) Get(ctx context.Context) (T, time.Duration, error) {
 			return v, age, nil
 		} else {
 			var zero T
-			return zero, age, ErrUpstreamUnavailable
+			return zero, age, errors.Join(ErrUpstreamUnavailable, err)
 		}
 	}
 	return r.fetchSync(ctx)

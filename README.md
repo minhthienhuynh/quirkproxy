@@ -33,7 +33,7 @@ See `config.sample.json`. Each provider shares one envelope:
 - `id`, `type`, `enabled`
 - `blacklist` / `whitelist` (model ids)
 - `refresh_ttl` + per-source `refresh` overrides, `max_cache_age`
-- `experimental` (include `alpha` models)
+- `experimental` (unused — `alpha` models are always included like CLI)
 - `options` (provider-specific, e.g. upstream URLs)
 - Chat recipe options: `zen_api_url`, `user_agent` (pinned genuine triple),
   `client`, `project`, `zen_api_key` (default `public`; private copies only),
@@ -59,7 +59,7 @@ Field sources are documented in `docs/v1-models.md`.
   (public, ~12h TTL)
 
 Filtering mirrors the opencode CLI: keep `cost.input == 0`, drop
-`deprecated` (and `alpha` unless experimental), intersect the Zen
+`deprecated` only (`alpha` kept like CLI), intersect the Zen
 catalog fail-closed, then apply blacklist/whitelist. Variants come
 from models.dev `reasoning_options`.
 

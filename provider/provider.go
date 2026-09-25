@@ -57,13 +57,13 @@ type DropReason string
 const (
 	// DropPrice means cost.input != 0.
 	DropPrice DropReason = "price"
-	// DropStatus means deprecated (or alpha without experimental).
+	// DropStatus means the model is deprecated.
 	DropStatus DropReason = "status"
 	// DropMissingCatalog means absent from the Zen catalog.
 	DropMissingCatalog DropReason = "missing_catalog"
 	// DropListFilter means removed by blacklist/whitelist.
 	DropListFilter DropReason = "list_filter"
-	// DropMissingMetadata means required metadata (e.g. cost) is absent.
+	// DropMissingMetadata is reserved for future metadata validation drops.
 	DropMissingMetadata DropReason = "missing_metadata"
 )
 

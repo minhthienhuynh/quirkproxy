@@ -96,15 +96,6 @@ func responsesHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler
 		if req.Input == nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
 		}
-		if req.Input == nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
-		}
-		if req.Input == nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
-		}
-		if req.Input == nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
-		}
 		rc, err := findResponsesProvider(c.Context(), reg, logger, req.Model, c.Params("provider", ""))
 		if err != nil {
 			return chatUpstreamError(c, logger, req.Model, err)

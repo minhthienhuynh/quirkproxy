@@ -96,12 +96,18 @@ func stringOption(opts map[string]any, key, fallback string) string {
 	return fallback
 }
 
+var (
+	_ provider.ModelLister        = (*Provider)(nil)
+	_ provider.ChatCompleter      = (*Provider)(nil)
+	_ provider.ResponsesCompleter = (*Provider)(nil)
+)
+
 // ID implements provider.ModelLister.
 func (p *Provider) ID() string { return p.id }
 
 // Capabilities implements provider.ModelLister.
 func (p *Provider) Capabilities() []provider.Capability {
-	return []provider.Capability{provider.CapabilityListModels, provider.CapabilityChat}
+	return []provider.Capability{provider.CapabilityListModels, provider.CapabilityChat, provider.CapabilityResponses}
 }
 
 // Chat implements provider.ChatCompleter.
@@ -112,6 +118,29 @@ func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider
 // ChatRaw implements provider.ChatCompleter.
 func (p *Provider) ChatRaw(ctx context.Context, req provider.ChatRequest) (io.ReadCloser, error) {
 	return p.chat.postRaw(ctx, buildBody(req, req.Model))
+}
+
+// Responses implements provider.ResponsesCompleter.
+func (p *Provider) Responses(ctx context.Context, req provider.ResponsesRequest) (provider.ResponsesResult, error) {
+	raw, err := p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model))
+	if err != nil {
+		return provider.ResponsesResult{}, err
+	}
+	defer raw.Close()
+	id, err := newRespID()
+	if err != nil {
+		return provider.ResponsesResult{}, err
+	}
+	payload, err := aggregateResponses(raw, id, req.Model, time.Now().Unix())
+	if err != nil {
+		return provider.ResponsesResult{}, err
+	}
+	return provider.ResponsesResult{Payload: payload}, nil
+}
+
+// ResponsesRaw implements provider.ResponsesCompleter.
+func (p *Provider) ResponsesRaw(ctx context.Context, req provider.ResponsesRequest) (io.ReadCloser, error) {
+	return p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model))
 }
 
 // ListModels implements provider.ModelLister.

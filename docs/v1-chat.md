@@ -55,7 +55,7 @@ Per-provider `options` (absent = off):
 | Option | Meaning |
 |---|---|
 | `recipe_check_interval` | e.g. `"1h"` — enables a periodic cheapest-probe chat; any failure logs ERROR |
-| `recipe_check_model` | model for the probe (default `mimo-v2.6-flash-free`) |
+| `recipe_check_model` | model for the probe (default: first model in allowlist) |
 | `zen_api_key` | key sent as Bearer (default `public`); lives only in your private config copy, never committed, never logged |
 
 ## Test cross-reference

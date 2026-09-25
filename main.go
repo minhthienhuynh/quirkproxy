@@ -39,7 +39,7 @@ func main() {
 			log.Fatalf("register provider: %v", err)
 		}
 		if !pc.Enabled {
-			logger.Info("provider disabled, skipping", "id", pc.ID)
+			logger.Info("provider registered but watchdog disabled", "id", pc.ID)
 		}
 		reg.SetEnabled(pc.ID, pc.Enabled)
 		cc, _ := p.(provider.ChatCompleter)
