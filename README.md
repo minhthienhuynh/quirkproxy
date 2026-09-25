@@ -1,0 +1,78 @@
+# quirkproxy
+
+OpenAI-compatible proxy that exposes **free** AI models with full
+configuration metadata. First provider: OpenCode Zen.
+
+## Quickstart
+
+```bash
+go build -o quirkproxy .
+./quirkproxy -config config.sample.json
+```
+
+- `GET http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
+- `GET http://127.0.0.1:8080/v1/models` → free models from all enabled providers
+- `GET http://127.0.0.1:8080/:provider/v1/models` → free models of one
+  provider only (e.g. `/opencode/v1/models`); unknown or disabled
+  provider → `404`
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`
+as its base URL. Flags: `-config <path>` (default `config.sample.json`).
+
+## Configuration
+
+See `config.sample.json`. Each provider shares one envelope:
+
+- `id`, `type`, `enabled`
+- `blacklist` / `whitelist` (model ids)
+- `refresh_ttl` + per-source `refresh` overrides, `max_cache_age`
+- `experimental` (include `alpha` models)
+- `options` (provider-specific, e.g. upstream URLs)
+
+## API
+
+`GET /v1/models` returns the OpenAI core shape (`id`, `object`,
+`created`, `owned_by`) plus extensions: `name`, `context_length`,
+`max_completion_tokens`, `pricing`, `capabilities` (tool_call,
+reasoning, attachment, temperature, modalities, interleaved),
+`variants` (reasoning effort levels), and a `quirk` debug namespace
+(`status`, `family`, `transport`, `endpoint`).
+
+Response header `X-Quirk-Cache-Age` reports data age in seconds.
+No usable cache + dead upstream → `503` (never an empty list).
+Field sources are documented in `docs/v1-models.md`.
+
+## Data sources (opencode provider)
+
+- Zen catalog: `GET https://opencode.ai/zen/v1/models` (public, ~1h TTL)
+- Metadata: `GET https://models.dev/api.json`, `opencode` entry
+  (public, ~12h TTL)
+
+Filtering mirrors the opencode CLI: keep `cost.input == 0`, drop
+`deprecated` (and `alpha` unless experimental), intersect the Zen
+catalog fail-closed, then apply blacklist/whitelist. Variants come
+from models.dev `reasoning_options`.
+
+## Repository layout
+
+```
+main.go               wiring: config → registry → server
+server/               Fiber app, routes, OpenAI mapping
+config/               shared config envelope
+model/                normalized internal model
+provider/             ModelLister interface, registry, shared
+                      cache (stale-while-revalidate), retry, diagnostics
+provider/opencode/    Zen free-models provider (+ testdata fixtures)
+docs/                 endpoint documentation
+openspec/             OpenSpec change history (zen-free-models)
+```
+
+Adding a provider = new package implementing `ModelLister` +
+one registration line. No reflection, no plugins.
+
+## Scope and limits
+
+- Listing only (`GET /v1/models`); no inference yet.
+- No auth on the proxy itself — bind `127.0.0.1` unless you
+  put it behind a reverse proxy with TLS.
+- Logs go to stderr (slog text).
