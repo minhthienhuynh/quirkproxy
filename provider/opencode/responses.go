@@ -2,12 +2,10 @@ package opencode
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 
 	"github.com/minhthienhuynh/quirkproxy/provider"
@@ -92,36 +90,7 @@ func (c *zenChatClient) postResponsesRaw(ctx context.Context, body respBody) (io
 	if err != nil {
 		return nil, fmt.Errorf("encode responses: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.recipe.BaseURL+"/responses", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("responses request: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.recipe.APIKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", c.recipe.UserAgent)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("x-opencode-client", c.recipe.Client)
-	httpReq.Header.Set("x-opencode-project", c.recipe.Project)
-	reqID, err := newRequestID()
-	if err != nil {
-		return nil, err
-	}
-	sesID, err := newSessionID()
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("x-opencode-request", reqID)
-	httpReq.Header.Set("x-opencode-session", sesID)
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("responses fetch: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		return nil, parseUpstreamError(resp)
-	}
-	return resp.Body, nil
+	return c.postToPath(ctx, "/responses", payload, "responses")
 }
 
 // aggregateResponses folds the SSE stream until response.completed and

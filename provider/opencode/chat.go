@@ -242,15 +242,12 @@ func buildBody(req provider.ChatRequest, model string) chatBody {
 
 // postRaw sends the body with the genuine recipe and returns the raw SSE
 // stream on 200. No retries: a 4xx is a decision, and every retry burns quota.
-func (c *zenChatClient) postRaw(ctx context.Context, body chatBody) (io.ReadCloser, error) {
-	payload, err := json.Marshal(body)
+// postToPath sends the payload to the given path with the genuine recipe
+// and returns the raw SSE stream on 200. Shared by chat and responses.
+func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []byte, kind string) (io.ReadCloser, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.recipe.BaseURL+path, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("encode chat: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.recipe.BaseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("chat request: %w", err)
+		return nil, fmt.Errorf("%s request: %w", kind, err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.recipe.APIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -271,13 +268,21 @@ func (c *zenChatClient) postRaw(ctx context.Context, body chatBody) (io.ReadClos
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("chat fetch: %w", err)
+		return nil, fmt.Errorf("%s fetch: %w", kind, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		return nil, parseUpstreamError(resp)
 	}
 	return resp.Body, nil
+}
+
+func (c *zenChatClient) postRaw(ctx context.Context, body chatBody) (io.ReadCloser, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encode chat: %w", err)
+	}
+	return c.postToPath(ctx, "/chat/completions", payload, "chat")
 }
 
 // chat posts one request with stream forced on (gate requirement) and

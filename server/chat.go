@@ -109,57 +109,88 @@ func newResponseID() string {
 	return "chatcmpl-" + hex.EncodeToString(b[:])
 }
 
-// findChatProvider resolves the enabled chat provider serving modelID via
-// the cached allowlist. With a non-empty filter the lookup scopes to that
-// single provider: unknown, disabled, non-chat, or model outside its
-// allowlist is a 404 without touching upstream. Without a filter, duplicate
-// model ids resolve first-wins deterministically with a warning, mirroring
-// modelsHandler. A missing model is a 404 UpstreamError; a ListModels
-// failure is 503/502: the model may exist behind a dead upstream.
-func findChatProvider(ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string) (provider.ChatCompleter, error) {
+// findProvider resolves the enabled provider serving modelID via the cached
+// allowlist. It checks the capability, the model's endpoint match, and
+// duplicates first-wins. kind is used in error messages.
+func findProvider[T any](ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string, cap provider.Capability, wantEndpoint, kind string, extract func(provider.ModelLister) (T, bool)) (T, error) {
+	var zero T
 	if filter != "" {
 		p, ok := reg.Lookup(filter)
-		if !ok || !reg.Enabled(filter) || !hasCapability(p, provider.CapabilityChat) {
-			return nil, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ProviderNotFound", Message: "unknown or disabled provider " + filter}
+		if !ok || !reg.Enabled(filter) || !hasCapability(p, cap) {
+			return zero, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ProviderNotFound", Message: "unknown or disabled provider " + filter}
 		}
 		if err := checkModel(ctx, p, modelID); err != nil {
-			return nil, err
+			return zero, err
 		}
-		cc, ok := p.(provider.ChatCompleter)
+		if err := checkEndpoint(ctx, p, modelID, wantEndpoint); err != nil {
+			return zero, err
+		}
+		t, ok := extract(p)
 		if !ok {
-			return nil, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises chat but does not implement it"}
+			return zero, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises " + kind + " but does not implement it"}
 		}
-		return cc, nil
+		return t, nil
 	}
-	var cc provider.ChatCompleter
+	var result T
 	keptID := ""
 	for _, p := range reg.SortedEnabled() {
-		if !hasCapability(p, provider.CapabilityChat) {
+		if !hasCapability(p, cap) {
 			continue
 		}
 		hit, err := modelAllowed(ctx, p, modelID)
 		if err != nil {
-			return nil, err
+			return zero, err
 		}
 		if !hit {
 			continue
 		}
-		candidate, ok := p.(provider.ChatCompleter)
-		if !ok {
-			return nil, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises chat but does not implement it"}
+		if err := checkEndpoint(ctx, p, modelID, wantEndpoint); err != nil {
+			continue // wrong endpoint: skip this provider
 		}
-		if cc != nil {
+		candidate, ok := extract(p)
+		if !ok {
+			return zero, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises " + kind + " but does not implement it"}
+		}
+		if keptID != "" {
 			logger.Warn("duplicate model id, keeping first",
 				"model", modelID, "kept_provider", keptID, "skipped_provider", p.ID())
 			continue
 		}
-		cc = candidate
+		result = candidate
 		keptID = p.ID()
 	}
-	if cc == nil {
-		return nil, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
+	if keptID == "" {
+		return zero, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
 	}
-	return cc, nil
+	return result, nil
+}
+
+// checkEndpoint rejects models whose endpoint does not match the requested
+// API (e.g. a responses-only model hit via /v1/chat/completions).
+func checkEndpoint(ctx context.Context, p provider.ModelLister, modelID, wantEndpoint string) error {
+	res, err := p.ListModels(ctx)
+	if err != nil {
+		return catalogUnavailable(err)
+	}
+	for _, m := range res.Models {
+		if m.ID == modelID {
+			if wantEndpoint != "" && m.Endpoint != "" && m.Endpoint != wantEndpoint {
+				return &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "WrongEndpoint", Message: "model " + modelID + " serves " + m.Endpoint + ", not " + wantEndpoint}
+			}
+			return nil
+		}
+	}
+	return &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
+}
+
+// findChatProvider wraps findProvider for chat completions.
+func findChatProvider(ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string) (provider.ChatCompleter, error) {
+	return findProvider(ctx, reg, logger, modelID, filter,
+		provider.CapabilityChat, "chat/completions", "chat",
+		func(p provider.ModelLister) (provider.ChatCompleter, bool) {
+			cc, ok := p.(provider.ChatCompleter)
+			return cc, ok
+		})
 }
 
 // modelAllowed reports whether modelID is in the provider's cached allowlist.

@@ -69,7 +69,7 @@ type modelList struct {
 }
 
 func catalogError(c fiber.Ctx, status int, msg string) error {
-	return c.Status(status).JSON(fiber.Map{"error": msg})
+	return c.Status(status).JSON(fiber.Map{"error": fiber.Map{"message": msg, "type": "invalid_request_error", "code": status}})
 }
 
 func toItem(m model.Model) modelItem {

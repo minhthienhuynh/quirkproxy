@@ -194,11 +194,15 @@ func TestModelsUpstreamDownNoCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	var got map[string]string
+	var got struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got["error"] == "" {
+	if got.Error.Message == "" {
 		t.Fatal("empty error message, want a clear message")
 	}
 }

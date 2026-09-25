@@ -33,53 +33,14 @@ type responsesWireTool struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// findResponsesProvider resolves the enabled Responses provider serving
-// modelID via the cached allowlist. Unknown, disabled, non-responses, or
-// model outside allowlist is 404 without touching upstream.
+// findResponsesProvider wraps findProvider for the Responses API.
 func findResponsesProvider(ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string) (provider.ResponsesCompleter, error) {
-	if filter != "" {
-		p, ok := reg.Lookup(filter)
-		if !ok || !reg.Enabled(filter) || !hasCapability(p, provider.CapabilityResponses) {
-			return nil, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ProviderNotFound", Message: "unknown or disabled provider " + filter}
-		}
-		if err := checkModel(ctx, p, modelID); err != nil {
-			return nil, err
-		}
-		rc, ok := p.(provider.ResponsesCompleter)
-		if !ok {
-			return nil, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises responses but does not implement it"}
-		}
-		return rc, nil
-	}
-	var rc provider.ResponsesCompleter
-	keptID := ""
-	for _, p := range reg.SortedEnabled() {
-		if !hasCapability(p, provider.CapabilityResponses) {
-			continue
-		}
-		hit, err := modelAllowed(ctx, p, modelID)
-		if err != nil {
-			return nil, err
-		}
-		if !hit {
-			continue
-		}
-		candidate, ok := p.(provider.ResponsesCompleter)
-		if !ok {
-			return nil, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises responses but does not implement it"}
-		}
-		if rc != nil {
-			logger.Warn("duplicate model id, keeping first",
-				"model", modelID, "kept_provider", keptID, "skipped_provider", p.ID())
-			continue
-		}
-		rc = candidate
-		keptID = p.ID()
-	}
-	if rc == nil {
-		return nil, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
-	}
-	return rc, nil
+	return findProvider(ctx, reg, logger, modelID, filter,
+		provider.CapabilityResponses, "responses", "responses",
+		func(p provider.ModelLister) (provider.ResponsesCompleter, bool) {
+			rc, ok := p.(provider.ResponsesCompleter)
+			return rc, ok
+		})
 }
 
 // responsesHandler serves POST /v1/responses and
