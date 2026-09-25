@@ -18,9 +18,10 @@ func testLogger() *slog.Logger {
 }
 
 type fakeLister struct {
-	id     string
-	models []model.Model
-	err    error
+	id      string
+	models  []model.Model
+	err     error
+	listErr error
 }
 
 func (f *fakeLister) ID() string {
@@ -35,6 +36,9 @@ func (f *fakeLister) Capabilities() []provider.Capability {
 }
 
 func (f *fakeLister) ListModels(_ context.Context) (provider.ListResult, error) {
+	if f.listErr != nil {
+		return provider.ListResult{}, f.listErr
+	}
 	if f.err != nil {
 		return provider.ListResult{}, f.err
 	}

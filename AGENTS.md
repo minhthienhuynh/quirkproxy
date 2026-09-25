@@ -4,10 +4,14 @@ Instructions for AI agents working in this repo. Not a human tutorial.
 
 ## Commands
 
-- Build: `go build ./...` — never commit the `quirkproxy` binary to root (gitignored).
-- Test: `go test ./...`; single package: `go test ./provider/opencode/`.
-- Gate before done: `go vet ./...` clean and `gofmt -l .` empty.
-- Run: `go build -o /tmp/quirkproxy . && /tmp/quirkproxy -config config.sample.json` (`:8080`).
+- Standard entry points (use these): `make build`, `make test`,
+  `make race`, `make vet`, `make fmt`, `make run`, `make smoke`, `make clean`.
+  Raw `go` commands only when make lacks the flag you need.
+- Gate before done: `make vet` clean, `make fmt` empty, `make test` green.
+  Touching shared/concurrent code? `make race` instead of `make test`.
+- Run: `make run` (`:8080`, config `config.sample.json`).
+  Smoke: `make smoke` (healthz + models, pid in `/tmp/qp.pid`).
+- Never commit the `quirkproxy` binary to root (gitignored, `make clean` removes it).
 - Stack: Go 1.27.1 + Fiber **v3**. v3 API differs from v2 — check `go doc` before assuming Config fields exist.
 
 ## Fetching model data from providers

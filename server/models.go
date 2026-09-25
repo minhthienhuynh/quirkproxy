@@ -3,9 +3,7 @@ package server
 import (
 	"errors"
 	"log/slog"
-	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -125,10 +123,7 @@ func modelsHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
 		items := []modelItem{}
 		seen := make(map[string]string)
 		var maxAge time.Duration
-		provs := reg.EnabledProviders()
-		slices.SortFunc(provs, func(a, b provider.ModelLister) int {
-			return strings.Compare(a.ID(), b.ID())
-		})
+		provs := reg.SortedEnabled()
 		if filter != "" {
 			p, ok := reg.Lookup(filter)
 			if !ok || !reg.Enabled(filter) {

@@ -15,7 +15,11 @@
       "max_cache_age": "24h",
       "options": {
         "zen_models_url": "https://opencode.ai/zen/v1/models",
-        "models_dev_url": "https://models.dev/api.json"
+        "models_dev_url": "https://models.dev/api.json",
+        "zen_api_url": "https://opencode.ai/zen/v1",
+        "user_agent": "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2",
+        "client": "cli",
+        "project": "global"
       }
     }
   ]

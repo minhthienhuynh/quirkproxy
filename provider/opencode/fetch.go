@@ -151,7 +151,14 @@ type devProvider struct {
 }
 
 func httpClient() *http.Client {
-	return &http.Client{Timeout: 15 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep a warm pool for concurrent upstream calls: the default keeps
+	// only 2 idle conns per host, forcing a fresh TCP+TLS handshake
+	// for every burst beyond that.
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 32
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{Timeout: 15 * time.Second, Transport: transport}
 }
 
 // fetchModelsDev GETs models.dev and extracts the opencode provider entry.

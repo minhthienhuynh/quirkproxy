@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/minhthienhuynh/quirkproxy/model"
@@ -13,7 +14,8 @@ type Capability string
 const (
 	// CapabilityListModels means the provider can list models.
 	CapabilityListModels Capability = "list_models"
-	// CapabilityChat is reserved for the future inference change.
+	// CapabilityChat marks providers with chat inference (see ChatCompleter).
+	// It is advertised via Capabilities alongside CapabilityListModels.
 	CapabilityChat Capability = "chat"
 )
 
@@ -38,10 +40,13 @@ type ModelLister interface {
 	ListModels(ctx context.Context) (ListResult, error)
 }
 
-// ChatCompleter is reserved for the future inference change.
-// It is intentionally left without methods in this change.
+// ChatCompleter is implemented by providers that can run chat inference.
 type ChatCompleter interface {
-	chatCompleter()
+	// Chat sends one chat request and returns the full aggregated result.
+	Chat(ctx context.Context, req ChatRequest) (ChatResult, error)
+	// ChatRaw sends one chat request and returns the raw upstream SSE
+	// stream. The caller must close the body. Used to relay streams.
+	ChatRaw(ctx context.Context, req ChatRequest) (io.ReadCloser, error)
 }
 
 // DropReason identifies the filter step that removed a model.

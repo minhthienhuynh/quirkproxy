@@ -2,6 +2,8 @@ package provider
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 )
 
@@ -63,6 +65,16 @@ func (r *Registry) Enabled(id string) bool {
 	}
 	_, off := r.disabled[id]
 	return !off
+}
+
+// SortedEnabled returns enabled providers ordered by id for deterministic
+// first-wins resolution of duplicate model ids across providers.
+func (r *Registry) SortedEnabled() []ModelLister {
+	provs := r.EnabledProviders()
+	slices.SortFunc(provs, func(a, b ModelLister) int {
+		return strings.Compare(a.ID(), b.ID())
+	})
+	return provs
 }
 
 // EnabledProviders returns all registered providers that are enabled.

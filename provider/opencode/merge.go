@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -31,6 +32,7 @@ type Provider struct {
 	devURL   string
 	zenCache *provider.Refresher[map[string]zenEntry]
 	devCache *provider.Refresher[devProvider]
+	chat     *zenChatClient
 }
 
 // New returns an opencode provider bound to the given config envelope.
@@ -65,6 +67,12 @@ func New(cfg config.Provider, logger *slog.Logger) *Provider {
 		}),
 		cfg.RefreshFor("models_dev"), cfg.MaxCacheAge.Std(),
 	)
+	p.chat = &zenChatClient{
+		client: client,
+		logger: logger,
+		recipe: recipeFromOptions(cfg.Options,
+			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/zen/v1")),
+	}
 	return p
 }
 
@@ -93,7 +101,17 @@ func (p *Provider) ID() string { return p.id }
 
 // Capabilities implements provider.ModelLister.
 func (p *Provider) Capabilities() []provider.Capability {
-	return []provider.Capability{provider.CapabilityListModels}
+	return []provider.Capability{provider.CapabilityListModels, provider.CapabilityChat}
+}
+
+// Chat implements provider.ChatCompleter.
+func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResult, error) {
+	return p.chat.chat(ctx, req, req.Model)
+}
+
+// ChatRaw implements provider.ChatCompleter.
+func (p *Provider) ChatRaw(ctx context.Context, req provider.ChatRequest) (io.ReadCloser, error) {
+	return p.chat.postRaw(ctx, buildBody(req, req.Model))
 }
 
 // ListModels implements provider.ModelLister.

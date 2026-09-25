@@ -6,15 +6,22 @@ configuration metadata. First provider: OpenCode Zen.
 ## Quickstart
 
 ```bash
-go build -o quirkproxy .
+make build
 ./quirkproxy -config config.sample.json
 ```
+
+Or `make run` (same thing). Verify with `make smoke`; full checks with
+`make vet`, `make fmt`, `make test` (`make race` for concurrent code).
 
 - `GET http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
 - `GET http://127.0.0.1:8080/v1/models` → free models from all enabled providers
 - `GET http://127.0.0.1:8080/:provider/v1/models` → free models of one
   provider only (e.g. `/opencode/v1/models`); unknown or disabled
   provider → `404`
+- `POST http://127.0.0.1:8080/v1/chat/completions` → chat over free
+  models (OpenAI shape in and out; `stream:true` relayed as SSE).
+  Scoped variant: `POST /:provider/v1/chat/completions`.
+  Details: `docs/v1-chat.md`.
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`
 as its base URL. Flags: `-config <path>` (default `config.sample.json`).
@@ -28,6 +35,9 @@ See `config.sample.json`. Each provider shares one envelope:
 - `refresh_ttl` + per-source `refresh` overrides, `max_cache_age`
 - `experimental` (include `alpha` models)
 - `options` (provider-specific, e.g. upstream URLs)
+- Chat recipe options: `zen_api_url`, `user_agent` (pinned genuine triple),
+  `client`, `project`, `zen_api_key` (default `public`; private copies only),
+  `recipe_check_interval` / `recipe_check_model` (optional watchdog)
 
 ## API
 
@@ -72,7 +82,7 @@ one registration line. No reflection, no plugins.
 
 ## Scope and limits
 
-- Listing only (`GET /v1/models`); no inference yet.
+- Chat covers `/v1/chat/completions` only; no `/v1/responses` yet.
 - No auth on the proxy itself — bind `127.0.0.1` unless you
   put it behind a reverse proxy with TLS.
 - Logs go to stderr (slog text).
