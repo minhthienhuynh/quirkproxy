@@ -1,0 +1,49 @@
+# Binaries & build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+*.test
+quirkproxy
+/dist/
+/bin/
+/build/
+
+# Go specific
+vendor/
+go.work
+go.work.sum
+*.coverprofile
+coverage.out
+coverage.html
+cpu.prof
+mem.prof
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+/tmp/
+tmp/
+
+# Tooling (local only)
+/.opencode/
+/openspec/
