@@ -17,6 +17,8 @@ const (
 	// CapabilityChat marks providers with chat inference (see ChatCompleter).
 	// It is advertised via Capabilities alongside CapabilityListModels.
 	CapabilityChat Capability = "chat"
+	// CapabilityResponses marks providers serving the Responses API.
+	CapabilityResponses Capability = "responses"
 )
 
 // ListResult is the outcome of one provider listing.

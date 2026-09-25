@@ -115,10 +115,16 @@ type devModel struct {
 	Family      string `json:"family"`
 	Status      string `json:"status"`
 	Cost        *struct {
-		Input      float64 `json:"input"`
-		Output     float64 `json:"output"`
-		CacheRead  float64 `json:"cache_read"`
-		CacheWrite float64 `json:"cache_write"`
+		Input           float64 `json:"input"`
+		Output          float64 `json:"output"`
+		CacheRead       float64 `json:"cache_read"`
+		CacheWrite      float64 `json:"cache_write"`
+		ContextOver200k *struct {
+			Input      float64 `json:"input"`
+			Output     float64 `json:"output"`
+			CacheRead  float64 `json:"cache_read"`
+			CacheWrite float64 `json:"cache_write"`
+		} `json:"context_over_200k"`
 	} `json:"cost"`
 	Limit *struct {
 		Context int `json:"context"`

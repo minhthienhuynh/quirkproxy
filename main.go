@@ -42,8 +42,10 @@ func main() {
 			logger.Info("provider disabled, skipping", "id", pc.ID)
 		}
 		reg.SetEnabled(pc.ID, pc.Enabled)
-		if cc, ok := p.(provider.ChatCompleter); ok && pc.Enabled {
-			startWatchdog(pc, p, cc, logger)
+		cc, _ := p.(provider.ChatCompleter)
+		rc, _ := p.(provider.ResponsesCompleter)
+		if (cc != nil || rc != nil) && pc.Enabled {
+			startWatchdog(pc, p, cc, rc, logger)
 		}
 	}
 
@@ -57,7 +59,7 @@ func main() {
 // via options.recipe_check_interval (e.g. "1h"). Absent or invalid means off.
 // An empty recipe_check_model probes the first allowlist model, so free-list
 // rotation never looks like gate rot.
-func startWatchdog(pc config.Provider, p provider.ModelLister, cc provider.ChatCompleter, logger *slog.Logger) {
+func startWatchdog(pc config.Provider, p provider.ModelLister, cc provider.ChatCompleter, rc provider.ResponsesCompleter, logger *slog.Logger) {
 	raw, _ := pc.Options["recipe_check_interval"].(string)
 	if raw == "" {
 		return
@@ -69,5 +71,5 @@ func startWatchdog(pc config.Provider, p provider.ModelLister, cc provider.ChatC
 	}
 	model, _ := pc.Options["recipe_check_model"].(string)
 	logger.Info("recipe watchdog on", "id", pc.ID, "interval", interval)
-	go provider.WatchRecipe(context.Background(), logger, p, cc, model, interval)
+	go provider.WatchRecipe(context.Background(), logger, p, cc, rc, model, interval)
 }

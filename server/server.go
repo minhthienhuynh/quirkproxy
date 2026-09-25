@@ -31,6 +31,10 @@ func New(reg *provider.Registry, logger *slog.Logger) *fiber.App {
 	// Provider-scoped chat, registered after the aggregate route
 	// because Fiber matches routes in registration order.
 	app.Post("/:provider/v1/chat/completions", chatHandler(reg, logger))
+	app.Post("/v1/responses", responsesHandler(reg, logger))
+	// Provider-scoped responses, registered after the aggregate route
+	// because Fiber matches routes in registration order.
+	app.Post("/:provider/v1/responses", responsesHandler(reg, logger))
 
 	return app
 }

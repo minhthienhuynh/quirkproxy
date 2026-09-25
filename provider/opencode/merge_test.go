@@ -89,7 +89,7 @@ func TestMergeDrops(t *testing.T) {
 		"muse-spark-1.2-contributor-free": provider.DropStatus,
 		"deepseek-v4-flash-free":          provider.DropStatus,
 		"qwen3.6-plus-free":               provider.DropStatus,
-		"test-cost-null":                  provider.DropMissingMetadata,
+		"test-cost-null":                  provider.DropMissingCatalog,
 		"test-absent-zen":                 provider.DropMissingCatalog,
 	}
 	for id, want := range cases {
@@ -188,12 +188,18 @@ func TestVariantsBudgetTokens(t *testing.T) {
 	}
 }
 
-func TestMergeAlphaAndWhitelist(t *testing.T) {
+func TestMergeAlphaKeptAndWhitelist(t *testing.T) {
 	cost0 := &struct {
-		Input      float64 `json:"input"`
-		Output     float64 `json:"output"`
-		CacheRead  float64 `json:"cache_read"`
-		CacheWrite float64 `json:"cache_write"`
+		Input           float64 `json:"input"`
+		Output          float64 `json:"output"`
+		CacheRead       float64 `json:"cache_read"`
+		CacheWrite      float64 `json:"cache_write"`
+		ContextOver200k *struct {
+			Input      float64 `json:"input"`
+			Output     float64 `json:"output"`
+			CacheRead  float64 `json:"cache_read"`
+			CacheWrite float64 `json:"cache_write"`
+		} `json:"context_over_200k"`
 	}{}
 	mkDev := func() devProvider {
 		return devProvider{NPM: "@ai-sdk/openai-compatible", Models: map[string]devModel{
@@ -204,8 +210,8 @@ func TestMergeAlphaAndWhitelist(t *testing.T) {
 	zen := map[string]zenEntry{"alpha-free": {ID: "alpha-free"}, "beta-free": {ID: "beta-free"}}
 
 	got, _ := merge(zen, mkDev(), testConfig(), "opencode")
-	if len(got) != 1 || got[0].ID != "beta-free" {
-		t.Fatalf("without experimental = %v, want only beta-free", got)
+	if len(got) != 2 {
+		t.Fatalf("alpha kept like CLI = %v, want both", got)
 	}
 	cfg := testConfig()
 	cfg.Experimental = true
@@ -217,5 +223,62 @@ func TestMergeAlphaAndWhitelist(t *testing.T) {
 	got, _ = merge(zen, mkDev(), cfg, "opencode")
 	if len(got) != 1 || got[0].ID != "alpha-free" {
 		t.Fatalf("with whitelist = %v, want only alpha-free", got)
+	}
+}
+
+func TestMergeMultiTierCost(t *testing.T) {
+	// Mirrors CLI: cost.some(c => c.input > 0) drops if ANY tier charges input.
+	// Model with base input=0 but context_over_200k.input>0 must be dropped.
+	costFree := &struct {
+		Input           float64 `json:"input"`
+		Output          float64 `json:"output"`
+		CacheRead       float64 `json:"cache_read"`
+		CacheWrite      float64 `json:"cache_write"`
+		ContextOver200k *struct {
+			Input      float64 `json:"input"`
+			Output     float64 `json:"output"`
+			CacheRead  float64 `json:"cache_read"`
+			CacheWrite float64 `json:"cache_write"`
+		} `json:"context_over_200k"`
+	}{}
+	costOver200kPaid := &struct {
+		Input           float64 `json:"input"`
+		Output          float64 `json:"output"`
+		CacheRead       float64 `json:"cache_read"`
+		CacheWrite      float64 `json:"cache_write"`
+		ContextOver200k *struct {
+			Input      float64 `json:"input"`
+			Output     float64 `json:"output"`
+			CacheRead  float64 `json:"cache_read"`
+			CacheWrite float64 `json:"cache_write"`
+		} `json:"context_over_200k"`
+	}{
+		ContextOver200k: &struct {
+			Input      float64 `json:"input"`
+			Output     float64 `json:"output"`
+			CacheRead  float64 `json:"cache_read"`
+			CacheWrite float64 `json:"cache_write"`
+		}{Input: 0.5},
+	}
+	mkDev := func() devProvider {
+		return devProvider{NPM: "@ai-sdk/openai-compatible", Models: map[string]devModel{
+			"free-all-tiers": {ID: "free-all-tiers", Cost: costFree},
+			"paid-over-200k": {ID: "paid-over-200k", Cost: costOver200kPaid},
+		}}
+	}
+	zen := map[string]zenEntry{"free-all-tiers": {ID: "free-all-tiers"}, "paid-over-200k": {ID: "paid-over-200k"}}
+
+	got, drops := merge(zen, mkDev(), testConfig(), "opencode")
+	if len(got) != 1 || got[0].ID != "free-all-tiers" {
+		t.Fatalf("got %v, want only free-all-tiers", got)
+	}
+	found := false
+	for _, d := range drops {
+		if d.ModelID == "paid-over-200k" && d.Reason == provider.DropPrice {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("paid-over-200k should drop with DropPrice, drops=%v", drops)
 	}
 }

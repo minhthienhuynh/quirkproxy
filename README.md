@@ -82,7 +82,7 @@ one registration line. No reflection, no plugins.
 
 ## Scope and limits
 
-- Chat covers `/v1/chat/completions` only; no `/v1/responses` yet.
+- Inference covers `/v1/chat/completions` and `/v1/responses`.
 - No auth on the proxy itself — bind `127.0.0.1` unless you
   put it behind a reverse proxy with TLS.
 - Logs go to stderr (slog text).

@@ -29,11 +29,11 @@ Variants rule (mirrors CLI `reasoningVariants`, `reasoning_options` only):
 effort → values verbatim; toggle → low/medium/high; budget_tokens → high/max;
 `[]`/absent → `{}` (this short-circuits the CLI family matrix — do not port it).
 
-Free rule (mirrors CLI, fail-closed where noted):
-`cost.input == 0` → drop `deprecated` (and `alpha` unless experimental) →
+Free rule (mirrors CLI):
+`cost.input == 0` (null cost treated as 0) → drop `deprecated` only →
 must exist in provider catalog (absent → drop + log; this also excludes
 models missing from models.dev entirely) → blacklist/whitelist.
-Null `cost` in models.dev → drop (CLI defaults it to 0; we fail closed instead).
+Multi-tier: `context_over_200k.input > 0` also counts as paid (matches CLI `cost.some(c => c.input > 0)`).
 
 ## When a provider updates models
 

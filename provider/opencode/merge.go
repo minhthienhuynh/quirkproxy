@@ -150,11 +150,7 @@ func merge(zen map[string]zenEntry, dev devProvider, cfg config.Provider, owner 
 
 	for _, id := range ids {
 		m := dev.Models[id]
-		if m.Cost == nil {
-			drop(id, provider.DropMissingMetadata, "models.dev cost is null")
-			continue
-		}
-		if m.Cost.Input != 0 {
+		if m.Cost != nil && (m.Cost.Input != 0 || (m.Cost.ContextOver200k != nil && m.Cost.ContextOver200k.Input != 0)) {
 			drop(id, provider.DropPrice, "cost.input != 0")
 			continue
 		}
@@ -162,7 +158,7 @@ func merge(zen map[string]zenEntry, dev devProvider, cfg config.Provider, owner 
 		if status == "" {
 			status = "active"
 		}
-		if status == "deprecated" || (status == "alpha" && !cfg.Experimental) {
+		if status == "deprecated" {
 			drop(id, provider.DropStatus, "status="+status)
 			continue
 		}
