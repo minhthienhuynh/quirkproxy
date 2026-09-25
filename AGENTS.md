@@ -35,6 +35,34 @@ must exist in provider catalog (absent → drop + log; this also excludes
 models missing from models.dev entirely) → blacklist/whitelist.
 Multi-tier: `context_over_200k.input > 0` also counts as paid (matches CLI `cost.some(c => c.input > 0)`).
 
+## opencode CLI reference
+
+Pinned version: **opencode v1.18.30** (source: `sst/opencode`, cloned to `/tmp/opencode-cli` for reference).
+
+Version-dependent constants in code:
+- `defaultUserAgent` in `provider/opencode/chat.go:22` — `"opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2"`
+- `x-opencode-*` headers generated per-request in `provider/opencode/chat.go` (`postToPath`)
+
+Key CLI source files (path in sst/opencode repo):
+| What | File |
+|---|---|
+| Free rule (cost → status → catalog → lists) | `packages/core/src/plugin/provider/opencode.ts` |
+| Model metadata / cost schema | `packages/core/src/plugin/models-dev.ts` |
+| Reasoning variants | `packages/core/src/plugin/variant.ts` |
+| Request headers (x-opencode-*) | `packages/opencode/src/session/llm/request.ts` |
+| User-Agent format | `USER_AGENT = opencode/${InstallationVersion}` (AI SDK appends provider-utils + runtime) |
+| Responses API body shape | `packages/core/src/session/llm/request.ts` (`buildRespBody`) |
+| Chat completions body shape | `packages/core/src/session/llm/request.ts` (`buildBody`) |
+
+### When opencode CLI releases a new version
+
+1. **Diff the recipe**: clone/checkout the new tag, diff `request.ts` headers and body builders against current `provider/opencode/chat.go` + `responses.go`. Any header or field change is a recipe change — update `defaultUserAgent` and `postToPath` accordingly.
+2. **Diff the free rule**: diff `opencode.ts` free-rule logic against `provider/opencode/merge.go`. Pay attention to cost schema changes (`models-dev.ts`) and status filtering.
+3. **Diff the transport rule**: check `fromModelsDevModel` for npm/url resolution changes — this drives `Endpoint` routing in `merge.go`.
+4. **Update `defaultUserAgent`**: change version string in `provider/opencode/chat.go:22` to match new `opencode/<version>`. The `ai-sdk/provider-utils` and `runtime/bun` parts may also change — verify against a real request from the new CLI.
+5. **Run ground truth**: `opencode models opencode --verbose` with the new CLI, compare against `curl /v1/models` output. Update fixtures if ids changed.
+6. **Test**: `make test && make race` — existing tests assert recipe headers and ID format; they should catch regressions.
+
 ## When a provider updates models
 
 1. Re-fetch both sources live and diff ids against the current output.
