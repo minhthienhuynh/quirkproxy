@@ -53,6 +53,15 @@ completer) returns `502 MisconfiguredProvider`. When upstream 429/503
 carries `retry-after` (or `retry-after-ms`), the response forwards it as a
 `Retry-After` header.
 
+Inference calls (chat and responses, direct and fallback) are bounded by the
+request context plus a configurable generation timeout, never by a fixed total
+request timeout — long generations are not cut off mid-stream. A timeout or
+transport failure surfaces as `502` with a typed envelope: `type:
+"UpstreamTimeout"` (context deadline / network timeout) or `type:
+"UpstreamTransport"` (dial/reset/connection), carrying the original cause in
+`message`. Only unclassifiable internal errors fall back to the generic
+`"chat upstream unavailable"` string.
+
 ## Notes
 
 - Array message content (`[{type:text,...}]`) keeps text parts joined by
@@ -73,6 +82,14 @@ Per-provider `options` (absent = off):
 | `recipe_check_model` | model for the probe (default: first model in allowlist) |
 | `zen_api_key` | key sent as Bearer (default `public`); lives only in your private config copy, never committed, never logged |
 
+Inference timeout options (duration strings, defaults apply when absent,
+empty, or non-positive):
+
+| Option | Meaning |
+|---|---|
+| `inference_generation_timeout` | safety-net bound on one inference call, headers + body (default `"10m"`); a generation longer than this fails as `UpstreamTimeout` |
+| `inference_header_timeout` | bound on the wait for upstream response headers (default `"30s"`); a dead upstream fails fast instead of hanging |
+
 ## Test cross-reference
 
 - Recipe headers/body/IDs: `provider/opencode/chat_test.go` → `TestChatRecipeHeaders`
@@ -85,3 +102,6 @@ Per-provider `options` (absent = off):
 - Truncation before any usable output (empty/reasoning-only) returns empty content + `finish_reason` instead of 502: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteEmptyOutput`
 - Payload `status` → chat `finish_reason` translation: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteFinishReason` (incl. `content_filter`), `TestTranslateResponsesPayloadFailedErrors`
 - Failed payload surfaces the upstream error unwrapped (502 `UpstreamResponseFailed`): `server/fallback_test.go` → `TestChatFallbackFailedPayloadSurfacesUpstreamError`
+- Inference client has no total timeout + generation bound (headers vs body): `provider/opencode/timeout_test.go` → `TestInferenceAndCatalogClientBounds`, `TestPostToPathGenerationBound`
+- Transport/timeout error classification: `provider/chat_test.go` → `TestClassifyTransportError`
+- Typed `UpstreamTimeout`/`UpstreamTransport` surfacing (not the catch-all): `server/upstream_error_test.go`

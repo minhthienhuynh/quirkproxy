@@ -344,10 +344,11 @@ func cutDataLine(line string) (string, bool) {
 // chatUpstreamError passes the upstream status and message through verbatim,
 // keeping any hint in a separate field so the original message is intact.
 // A carried retry-after value is forwarded as a Retry-After response header
-// so downstream clients back off on the server's schedule.
+// so downstream clients back off on the server's schedule. Transport/timeout
+// failures are upgraded to a typed envelope (UpstreamTimeout/UpstreamTransport)
+// instead of the generic catch-all, which is reserved for unclassifiable errors.
 func chatUpstreamError(c fiber.Ctx, logger *slog.Logger, model string, err error) error {
-	var uerr *provider.UpstreamError
-	if errors.As(err, &uerr) {
+	if uerr := asUpstreamError(err); uerr != nil {
 		body := fiber.Map{"message": uerr.Message, "type": uerr.Type, "code": uerr.Status}
 		if uerr.Hint != "" {
 			body["hint"] = uerr.Hint
@@ -359,4 +360,21 @@ func chatUpstreamError(c fiber.Ctx, logger *slog.Logger, model string, err error
 	}
 	logger.Error("chat failed", "model", model, "error", err)
 	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "chat upstream unavailable"})
+}
+
+// asUpstreamError resolves err to a typed UpstreamError: one already typed, or
+// a transport/timeout failure classified by provider.ClassifyTransportError.
+// Returns nil when err cannot be classified, leaving the generic fallback.
+func asUpstreamError(err error) *provider.UpstreamError {
+	if err == nil {
+		return nil
+	}
+	var uerr *provider.UpstreamError
+	if errors.As(err, &uerr) {
+		return uerr
+	}
+	if errors.As(provider.ClassifyTransportError(err), &uerr) {
+		return uerr
+	}
+	return nil
 }

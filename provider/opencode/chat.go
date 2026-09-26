@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/minhthienhuynh/quirkproxy/provider"
 )
@@ -92,6 +93,10 @@ type zenChatClient struct {
 	client *http.Client
 	recipe Recipe
 	logger *slog.Logger
+	// genTimeout bounds one inference call (headers + body/stream) as a
+	// safety net; the body lifetime is otherwise bounded by the caller's
+	// context (client disconnect). Zero means no bound (tests only).
+	genTimeout time.Duration
 }
 
 // chatBody is the Zen wire shape (OpenAI-compatible subset).
@@ -244,9 +249,13 @@ func buildBody(req provider.ChatRequest, model string) chatBody {
 // stream on 200. No retries: a 4xx is a decision, and every retry burns quota.
 // postToPath sends the payload to the given path with the genuine recipe
 // and returns the raw SSE stream on 200. Shared by chat and responses.
+// The call is bounded by genTimeout (headers + body) as a safety net on top
+// of the caller's context; the bound is cancelled when the body is closed.
 func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []byte, kind string) (io.ReadCloser, error) {
+	ctx, cancel := c.boundContext(ctx)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.recipe.BaseURL+path, bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("%s request: %w", kind, err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.recipe.APIKey)
@@ -257,10 +266,12 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 	httpReq.Header.Set("x-opencode-project", c.recipe.Project)
 	reqID, err := newRequestID()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	sesID, err := newSessionID()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	httpReq.Header.Set("x-opencode-request", reqID)
@@ -268,13 +279,42 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("%s fetch: %w", kind, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		return nil, parseUpstreamError(resp)
+		// Read the error body before cancelling: cancelling the request
+		// context first could abort a still-in-flight body read and drop
+		// the upstream error message.
+		uerr := parseUpstreamError(resp)
+		cancel()
+		return nil, uerr
 	}
-	return resp.Body, nil
+	return &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}, nil
+}
+
+// boundContext applies the generation safety timeout when set, returning a
+// cancel that must be called to release the timer (wired to body Close).
+func (c *zenChatClient) boundContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.genTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.genTimeout)
+}
+
+// cancelReadCloser ties the bound-context cancel to the body's Close so the
+// safety-net timer does not outlive a successful short call.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close closes the body and releases the bound-context timer.
+func (r *cancelReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.cancel()
+	return err
 }
 
 func (c *zenChatClient) postRaw(ctx context.Context, body chatBody) (io.ReadCloser, error) {

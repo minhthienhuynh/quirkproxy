@@ -144,15 +144,43 @@ type devProvider struct {
 	Models map[string]devModel `json:"models"`
 }
 
-func httpClient() *http.Client {
+// Inference transport bounds. Time-to-response-headers is capped so a dead
+// upstream fails fast; the generation lifetime is capped per call via context
+// (see postToPath), not by a fixed Client.Timeout that would also cut long
+// streaming generations.
+const (
+	defaultInferenceGenerationTimeout = 10 * time.Minute
+	defaultInferenceHeaderTimeout     = 30 * time.Second
+)
+
+// warmTransport returns the shared connection pool used by every upstream
+// call. The default keeps only 2 idle conns per host, forcing a fresh TCP+TLS
+// handshake for every burst beyond that.
+func warmTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Keep a warm pool for concurrent upstream calls: the default keeps
-	// only 2 idle conns per host, forcing a fresh TCP+TLS handshake
-	// for every burst beyond that.
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
 	transport.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Timeout: 15 * time.Second, Transport: transport}
+	return transport
+}
+
+// httpClient is the catalog client: small JSON fetches bounded by a total
+// request timeout.
+func httpClient() *http.Client {
+	return &http.Client{Timeout: 15 * time.Second, Transport: warmTransport()}
+}
+
+// inferenceClient is the inference client. It carries no Client.Timeout:
+// Client.Timeout covers the whole exchange including body reads, which would
+// cut long generations off mid-stream. Only the wait for response headers is
+// bounded here; the body/stream lifetime is bounded per call via context.
+func inferenceClient(headerTimeout time.Duration) *http.Client {
+	if headerTimeout <= 0 {
+		headerTimeout = defaultInferenceHeaderTimeout
+	}
+	transport := warmTransport()
+	transport.ResponseHeaderTimeout = headerTimeout
+	return &http.Client{Transport: transport}
 }
 
 // fetchModelsDev GETs models.dev and extracts the opencode provider entry.

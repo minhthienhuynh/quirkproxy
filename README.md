@@ -38,6 +38,10 @@ See `config.sample.json`. Each provider shares one envelope:
 - Chat recipe options: `zen_api_url`, `user_agent` (pinned genuine triple),
   `client`, `project`, `zen_api_key` (default `public`; private copies only),
   `recipe_check_interval` / `recipe_check_model` (optional watchdog)
+- Inference timeout options (duration strings): `inference_generation_timeout`
+  (default `10m`, safety-net bound per call) and `inference_header_timeout`
+  (default `30s`, wait for upstream headers). Inference is never cut off by a
+  fixed total request timeout.
 
 ## API
 

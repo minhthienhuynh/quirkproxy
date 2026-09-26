@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/minhthienhuynh/quirkproxy/config"
@@ -68,8 +69,9 @@ func New(cfg config.Provider, logger *slog.Logger) *Provider {
 		cfg.RefreshFor("models_dev"), cfg.MaxCacheAge.Std(),
 	)
 	p.chat = &zenChatClient{
-		client: client,
-		logger: logger,
+		client:     inferenceClient(durationOption(cfg.Options, "inference_header_timeout", defaultInferenceHeaderTimeout)),
+		logger:     logger,
+		genTimeout: durationOption(cfg.Options, "inference_generation_timeout", defaultInferenceGenerationTimeout),
 		recipe: recipeFromOptions(cfg.Options,
 			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/zen/v1")),
 	}
@@ -94,6 +96,29 @@ func stringOption(opts map[string]any, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// durationOption reads a duration string (e.g. "10m", "30s") from options.
+// Absent, empty, malformed, or non-positive values fall back to the default so
+// a bad config value never disables the bound entirely.
+func durationOption(opts map[string]any, key string, fallback time.Duration) time.Duration {
+	v, ok := opts[key]
+	if !ok {
+		return fallback
+	}
+	s, ok := v.(string)
+	if !ok {
+		return fallback
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 var (

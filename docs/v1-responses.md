@@ -74,8 +74,16 @@ rejection: a model served by the other protocol is translated, not refused.
 | Model owned by a provider that cannot serve its endpoint | 502 MisconfiguredProvider |
 | Upstream 4xx | verbatim status + message (403 + hint) |
 | Upstream `response.failed` (buffered) | 502 UpstreamResponseFailed + upstream message |
+| Inference timeout (generation bound exceeded) | 502 UpstreamTimeout + cause |
+| Transport failure (dial/reset/connection) | 502 UpstreamTransport + cause |
 | No cache + dead upstream (allowlist) | 503 |
 | Usable cache + dead upstream (allowlist) | 502 |
+
+Inference calls are bounded by the request context plus a configurable
+generation timeout (see `docs/v1-chat.md` options), never by a fixed total
+request timeout — long generations are not cut off mid-stream. Timeout and
+transport failures carry the original cause in `message`; only unclassifiable
+internal errors fall back to the generic `"chat upstream unavailable"` string.
 
 Upstream `retry-after` (or `retry-after-ms`) on 429/503 is forwarded as a
 `Retry-After` response header.
