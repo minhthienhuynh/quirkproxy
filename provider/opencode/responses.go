@@ -93,9 +93,21 @@ func (c *zenChatClient) postResponsesRaw(ctx context.Context, body respBody) (io
 	return c.postToPath(ctx, "/responses", payload, "responses")
 }
 
-// aggregateResponses folds the SSE stream until response.completed and
-// returns that event's response object with the envelope rewritten.
-// Output items pass through byte-identical.
+// Terminal Responses SSE events. The final response object arrives on
+// response.completed, or on response.incomplete when the model hits
+// max_output_tokens (truncated output, status "incomplete"); both are
+// folded below. response.failed carries an upstream error.
+const (
+	respEventCompleted  = "response.completed"
+	respEventIncomplete = "response.incomplete"
+	respEventFailed     = "response.failed"
+)
+
+// aggregateResponses folds the SSE stream until a terminal event
+// (response.completed or response.incomplete) and returns that event's
+// response object with the envelope rewritten. Output items pass through
+// byte-identical. response.failed becomes an UpstreamError carrying the
+// upstream error message instead of a payload callers cannot use.
 func aggregateResponses(r io.Reader, id, model string, createdAt int64) ([]byte, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -111,7 +123,15 @@ func aggregateResponses(r io.Reader, id, model string, createdAt int64) ([]byte,
 		var ev struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal([]byte(data), &ev) != nil || ev.Type != "response.completed" {
+		if json.Unmarshal([]byte(data), &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case respEventFailed:
+			return nil, responsesFailedError(data)
+		case respEventCompleted, respEventIncomplete:
+			// terminal event: fold below
+		default:
 			continue
 		}
 		var full map[string]json.RawMessage
@@ -138,5 +158,23 @@ func aggregateResponses(r io.Reader, id, model string, createdAt int64) ([]byte,
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read sse: %w", err)
 	}
-	return nil, fmt.Errorf("responses: completed event not found")
+	return nil, fmt.Errorf("responses: terminal event not found (response.completed or response.incomplete)")
+}
+
+// responsesFailedError maps a response.failed event to an UpstreamError
+// carrying the upstream error message, so the handler answers 502 with the
+// real cause instead of a payload without usable output.
+func responsesFailedError(data string) error {
+	var failed struct {
+		Response struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}
+	msg := "upstream response failed"
+	if json.Unmarshal([]byte(data), &failed) == nil && failed.Response.Error.Message != "" {
+		msg = failed.Response.Error.Message
+	}
+	return &provider.UpstreamError{Status: 502, Type: "UpstreamResponseFailed", Message: msg}
 }

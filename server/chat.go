@@ -170,6 +170,10 @@ func serveChatFallback(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister,
 	}
 	chatRes, err := responsesPayloadToChatResult(res.Payload)
 	if err != nil {
+		var uerr *provider.UpstreamError
+		if errors.As(err, &uerr) {
+			return chatUpstreamError(c, logger, req.Model, uerr)
+		}
 		return chatUpstreamError(c, logger, req.Model, &provider.UpstreamError{
 			Status: fiber.StatusBadGateway, Type: "TranslateError",
 			Message: "fallback translate failed: " + err.Error(),
@@ -177,7 +181,7 @@ func serveChatFallback(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister,
 	}
 	if req.Stream {
 		setSSEHeaders(c)
-		return c.SendString(synthesizeChatSSE(chatRes.Content, chatRes.ToolCalls, req.Model, newResponseID(), time.Now().Unix()))
+		return c.SendString(synthesizeChatSSE(chatRes, req.Model, newResponseID(), time.Now().Unix()))
 	}
 	return writeChatResponse(c, req.Model, chatRes)
 }
@@ -195,19 +199,29 @@ func droppedChatFields(req chatRequest) []string {
 	return out
 }
 
+// chatFinishReason derives the chat finish_reason: a transport-derived
+// override (e.g. "length" from a truncated responses payload) wins over
+// the derived stop/tool_calls default.
+func chatFinishReason(res provider.ChatResult) string {
+	if res.FinishReason != "" {
+		return res.FinishReason
+	}
+	if len(res.ToolCalls) > 0 {
+		return "tool_calls"
+	}
+	return "stop"
+}
+
 // writeChatResponse renders a chat.completion JSON response.
 func writeChatResponse(c fiber.Ctx, model string, res provider.ChatResult) error {
 	reply := chatReply{Role: "assistant", Content: res.Content}
-	finish := "stop"
 	for _, tc := range res.ToolCalls {
 		var rtc replyToolCall
 		rtc.ID, rtc.Type = tc.ID, "function"
 		rtc.Function.Name, rtc.Function.Arguments = tc.Name, tc.Arguments
 		reply.ToolCalls = append(reply.ToolCalls, rtc)
 	}
-	if len(reply.ToolCalls) > 0 {
-		finish = "tool_calls"
-	}
+	finish := chatFinishReason(res)
 	return c.JSON(chatResponse{
 		ID: newResponseID(), Object: "chat.completion", Created: time.Now().Unix(),
 		Model: model, Choices: []chatChoice{{Index: 0, Message: reply, FinishReason: finish}},

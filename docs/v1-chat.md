@@ -33,9 +33,9 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
 | `model` | must be in the free allowlist, else 404 before upstream |
 | `messages[]` | `role`/`content` verbatim on the direct path; via fallback a single message keeps plain text, multi-turn joins `role: content` lines |
 | `tools[]` | OpenAI function shape verbatim + gate entries ensured (mapped 1-1 through fallback) |
-| `tool_choice`, `temperature`, `max_tokens` | verbatim when present on the direct path; `tool_choice`/`temperature` are dropped on the fallback path (responses wire has no equivalent), `max_tokens` maps to `max_output_tokens` |
+| `tool_choice`, `temperature`, `max_tokens` | verbatim when present on the direct path; `tool_choice`/`temperature` are dropped on the fallback path (responses wire has no equivalent), `max_tokens` maps to `max_output_tokens`; a truncated responses payload (`status:"incomplete"`) keeps its partial output — empty content when the cut landed before any usable output — and reports `finish_reason: length`, or `content_filter` when its `incomplete_details.reason` is `content_filter` |
 | `stream:true` | SSE relay: envelope rewritten, deltas verbatim, single proxy-emitted `[DONE]` |
-| response | `{object:chat.completion, choices:[{message:{role,content,tool_calls?}, finish_reason: stop\|tool_calls}]}` |
+| response | `{object:chat.completion, choices:[{message:{role,content,tool_calls?}, finish_reason: stop\|tool_calls\|length\|content_filter}]}` |
 | `tool_calls` | aggregated from SSE deltas by index; arguments concatenated in order |
 
 ## Errors
@@ -46,6 +46,8 @@ User-Agent recipe`. No retry on 4xx. No cache + dead upstream on the
 allowlist lookup behaves like `GET /v1/models` (503).
 Fallback errors pass through the same way. There is no `WrongEndpoint`
 rejection: a model served by the other protocol is translated, not refused.
+A `status:"failed"` responses payload on the fallback path returns
+`502 UpstreamResponseFailed` carrying the upstream message.
 A model owned by a provider that cannot serve its endpoint (missing
 completer) returns `502 MisconfiguredProvider`. When upstream 429/503
 carries `retry-after` (or `retry-after-ms`), the response forwards it as a
@@ -79,3 +81,7 @@ Per-provider `options` (absent = off):
 - Key redaction: `TestRecipeDefaultsAndNoKeyLeak`
 - Handler (mapping, 400/404, tool_calls): `server/chat_test.go`
 - Protocol fallback (chat calling responses models, buffered stream): `server/fallback_test.go` → `TestChatFallbackToResponses`, `server/translate_test.go`
+- Truncated fallback output keeps content and reports `finish_reason:"length"` (JSON + stream): `server/fallback_test.go` → `TestChatFallbackIncompleteKeepsTruncatedOutput`, `TestChatFallbackIncompleteStreamFinishReason`
+- Truncation before any usable output (empty/reasoning-only) returns empty content + `finish_reason` instead of 502: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteEmptyOutput`
+- Payload `status` → chat `finish_reason` translation: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteFinishReason` (incl. `content_filter`), `TestTranslateResponsesPayloadFailedErrors`
+- Failed payload surfaces the upstream error unwrapped (502 `UpstreamResponseFailed`): `server/fallback_test.go` → `TestChatFallbackFailedPayloadSurfacesUpstreamError`

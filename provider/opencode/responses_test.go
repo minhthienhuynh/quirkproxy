@@ -232,7 +232,76 @@ func TestResponsesNoCompletedEvent(t *testing.T) {
 	}
 	defer raw.Close()
 	_, err = aggregateResponses(raw, "resp_x", "m", 1)
-	if err == nil || !strings.Contains(err.Error(), "completed event not found") {
-		t.Fatalf("err = %v, want completed event not found", err)
+	if err == nil || !strings.Contains(err.Error(), "terminal event not found") {
+		t.Fatalf("err = %v, want terminal event not found", err)
+	}
+}
+
+func TestResponsesIncompleteEventFolds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+				"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\"}\n\n" +
+				"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_up\",\"model\":\"m\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"cut\"}]}]}}\n\n",
+		))
+	}))
+	defer srv.Close()
+	c := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+	raw, err := c.postResponsesRaw(context.Background(), buildRespBody(provider.ResponsesRequest{Model: "m", Input: "hi"}, "m"))
+	if err != nil {
+		t.Fatalf("postResponsesRaw: %v", err)
+	}
+	defer raw.Close()
+	payload, err := aggregateResponses(raw, "resp_z", "m", 7)
+	if err != nil {
+		t.Fatalf("aggregateResponses: %v (incomplete must fold like completed)", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["status"] != "incomplete" || got["id"] != "resp_z" || got["model"] != "m" {
+		t.Fatalf("payload = %v, want status incomplete with rewritten envelope", got)
+	}
+	if got["created_at"].(float64) != 7 {
+		t.Fatalf("created_at = %v, want 7", got["created_at"])
+	}
+	output, _ := got["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output len = %d, want 1 (items pass through byte-identical)", len(output))
+	}
+	msg := output[0].(map[string]any)
+	text := msg["content"].([]any)[0].(map[string]any)["text"]
+	if msg["type"] != "message" || text != "cut" {
+		t.Fatalf("output item = %v, want message with text cut", output[0])
+	}
+	details, _ := got["incomplete_details"].(map[string]any)
+	if details["reason"] != "max_output_tokens" {
+		t.Fatalf("incomplete_details = %v, want reason max_output_tokens pass-through", got["incomplete_details"])
+	}
+}
+
+func TestResponsesFailedEventSurfacesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"quota exhausted\"}}}\n\n",
+		))
+	}))
+	defer srv.Close()
+	c := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+	raw, err := c.postResponsesRaw(context.Background(), buildRespBody(provider.ResponsesRequest{Model: "m", Input: "hi"}, "m"))
+	if err != nil {
+		t.Fatalf("postResponsesRaw: %v", err)
+	}
+	defer raw.Close()
+	_, err = aggregateResponses(raw, "resp_f", "m", 1)
+	var ue *provider.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v, want UpstreamError", err)
+	}
+	if ue.Status != 502 || ue.Message != "quota exhausted" {
+		t.Fatalf("upstream error = %+v, want 502 quota exhausted", ue)
 	}
 }

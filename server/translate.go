@@ -115,17 +115,37 @@ func parseInputItem(item any) (string, string) {
 	return role, text
 }
 
-// responsesPayloadToChatResult folds a completed Responses payload into a
+// responsesPayloadToChatResult folds a terminal Responses payload into a
 // chat result: message items concatenate output_text, function_call items
-// become tool calls, reasoning items are dropped. A payload folding to
-// nothing usable (no message and no function_call) is an error so the
-// handler surfaces 502 instead of rendering an empty 200.
+// become tool calls, reasoning items are dropped. status "incomplete"
+// (truncation) keeps its partial output and reports the cut through
+// FinishReason — including an empty result when the cut landed before any
+// usable output (reasoning-only). status "failed" is an error carrying the
+// upstream message. A non-truncated payload folding to nothing usable (no
+// message and no function_call) is an error so the handler surfaces 502
+// instead of rendering an empty 200.
 func responsesPayloadToChatResult(payload []byte) (provider.ChatResult, error) {
 	var resp struct {
-		Output []json.RawMessage `json:"output"`
+		Output            []json.RawMessage `json:"output"`
+		Status            string            `json:"status"`
+		IncompleteDetails struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		return provider.ChatResult{}, err
+	}
+	if resp.Status == "failed" {
+		msg := resp.Error.Message
+		if msg == "" {
+			msg = "upstream response failed"
+		}
+		return provider.ChatResult{}, &provider.UpstreamError{
+			Status: 502, Type: "UpstreamResponseFailed", Message: msg,
+		}
 	}
 	var out provider.ChatResult
 	sawUsable := false
@@ -184,7 +204,13 @@ func responsesPayloadToChatResult(payload []byte) (provider.ChatResult, error) {
 			out.ToolCalls = append(out.ToolCalls, provider.ToolCall{ID: id, Name: call.Name, Arguments: call.Arguments})
 		}
 	}
-	if !sawUsable {
+	if resp.Status == "incomplete" {
+		out.FinishReason = "length"
+		if resp.IncompleteDetails.Reason == "content_filter" {
+			out.FinishReason = "content_filter"
+		}
+	}
+	if !sawUsable && resp.Status != "incomplete" {
 		return provider.ChatResult{}, fmt.Errorf("responses: no message or function_call in output")
 	}
 	return out, nil
@@ -215,19 +241,18 @@ func chatResultToResponsesPayload(res provider.ChatResult, model, id string, cre
 
 // synthesizeChatSSE renders one full chat chunk plus a single [DONE] for the
 // buffered-fallback stream path.
-func synthesizeChatSSE(content string, toolCalls []provider.ToolCall, model, id string, created int64) string {
-	delta := map[string]any{"role": "assistant", "content": content}
-	finish := "stop"
-	if len(toolCalls) > 0 {
-		tcs := make([]any, 0, len(toolCalls))
-		for i, tc := range toolCalls {
+func synthesizeChatSSE(res provider.ChatResult, model, id string, created int64) string {
+	delta := map[string]any{"role": "assistant", "content": res.Content}
+	finish := chatFinishReason(res)
+	if len(res.ToolCalls) > 0 {
+		tcs := make([]any, 0, len(res.ToolCalls))
+		for i, tc := range res.ToolCalls {
 			tcs = append(tcs, map[string]any{
 				"index": i, "id": tc.ID, "type": "function",
 				"function": map[string]any{"name": tc.Name, "arguments": tc.Arguments},
 			})
 		}
 		delta["tool_calls"] = tcs
-		finish = "tool_calls"
 	}
 	chunk, _ := json.Marshal(map[string]any{
 		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,

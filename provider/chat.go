@@ -38,6 +38,11 @@ type ToolCall struct {
 type ChatResult struct {
 	Content   string
 	ToolCalls []ToolCall
+	// FinishReason, when set, overrides the handler-derived finish_reason
+	// ("stop"/"tool_calls") with a transport-derived value: "length" when
+	// the result was cut by the output-token limit, "content_filter" when
+	// it was cut by a content filter.
+	FinishReason string
 }
 
 // UpstreamError preserves the upstream API rejection status and message.
