@@ -46,9 +46,114 @@ func TestTranslateChatToResponsesMultiMessage(t *testing.T) {
 		},
 	}
 	got := chatToResponses(req)
-	s, _ := got.Input.(string)
-	if !strings.Contains(s, "system: sys") || !strings.Contains(s, "user: hi") {
-		t.Fatalf("input = %q, want role-prefixed lines", s)
+	items, ok := got.Input.([]any)
+	if !ok {
+		t.Fatalf("input = %T, want []any structured items", got.Input)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+	// Genuine shape: no explicit "message" type; system content is a string.
+	m0 := itemMap(t, items[0])
+	if m0["role"] != "system" {
+		t.Fatalf("items[0].role = %v, want system", m0["role"])
+	}
+	if _, hasType := m0["type"]; hasType {
+		t.Fatalf("message item must not carry a type field: %+v", m0)
+	}
+	if s, ok := m0["content"].(string); !ok || s != "sys" {
+		t.Fatalf("system content = %#v, want string \"sys\"", m0["content"])
+	}
+	// User content is an input_text array.
+	m1 := itemMap(t, items[1])
+	if m1["role"] != "user" {
+		t.Fatalf("items[1].role = %v, want user", m1["role"])
+	}
+	parts, ok := m1["content"].([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("user content = %#v, want one-part array", m1["content"])
+	}
+	if p := itemMap(t, parts[0]); p["type"] != "input_text" || p["text"] != "hi" {
+		t.Fatalf("user part = %+v, want input_text/hi", p)
+	}
+}
+
+// itemMap asserts it is a JSON object and returns it.
+func itemMap(t *testing.T, it any) map[string]any {
+	t.Helper()
+	m, ok := it.(map[string]any)
+	if !ok {
+		t.Fatalf("item = %T, want map", it)
+	}
+	return m
+}
+
+// Task 2.2/2.3: multi-turn tool history maps to structured input items
+// (function_call / function_call_output) with call_id linkage preserved, not a
+// flat "role: content" string. function_call carries call_id only (no item id).
+func TestChatToResponsesPreservesToolLoop(t *testing.T) {
+	req := provider.ChatRequest{
+		Model: "muse-spark",
+		Messages: []provider.ChatMessage{
+			{Role: "user", Content: "add gemini"},
+			{Role: "assistant", Content: "checking", ToolCalls: []provider.ToolCall{
+				{ID: "call_1", Name: "read", Arguments: `{"filePath":"c.json"}`},
+				{ID: "call_2", Name: "bash", Arguments: `{"command":"curl"}`},
+			}},
+			{Role: "tool", ToolCallID: "call_1", Content: "{cfg}"},
+			{Role: "tool", ToolCallID: "call_2", Content: "{out}"},
+		},
+	}
+	got := chatToResponses(req)
+	items, ok := got.Input.([]any)
+	if !ok {
+		t.Fatalf("input = %T, want []any", got.Input)
+	}
+	// user msg, assistant msg, call_1, call_2, out_1, out_2 = 6 items
+	if len(items) != 6 {
+		t.Fatalf("items = %d, want 6 (msg,msg,call,call,out,out): %+v", len(items), items)
+	}
+	var calls, outputs []map[string]any
+	for _, it := range items {
+		m := itemMap(t, it)
+		switch m["type"] {
+		case "function_call":
+			calls = append(calls, m)
+		case "function_call_output":
+			outputs = append(outputs, m)
+		}
+	}
+	if len(calls) != 2 || len(outputs) != 2 {
+		t.Fatalf("calls=%d outputs=%d, want 2/2", len(calls), len(outputs))
+	}
+	callIDs := map[string]bool{}
+	for _, c := range calls {
+		callIDs[c["call_id"].(string)] = true
+		if c["name"].(string) == "" || c["arguments"].(string) == "" {
+			t.Fatalf("call missing name/arguments: %+v", c)
+		}
+		if _, hasID := c["id"]; hasID {
+			t.Fatalf("function_call must not set an item id (only call_id): %+v", c)
+		}
+	}
+	for _, o := range outputs {
+		id, _ := o["call_id"].(string)
+		if !callIDs[id] {
+			t.Fatalf("output call_id %v not linked to any call", o["call_id"])
+		}
+		if s, _ := o["output"].(string); s == "" {
+			t.Fatalf("output missing text: %+v", o)
+		}
+	}
+}
+
+// Task 2.2 back-compat: a lone text message still maps to a plain string.
+func TestChatToResponsesSingleTextBackCompat(t *testing.T) {
+	got := chatToResponses(provider.ChatRequest{
+		Model: "m", Messages: []provider.ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if s, ok := got.Input.(string); !ok || s != "hi" {
+		t.Fatalf("input = %#v, want string \"hi\"", got.Input)
 	}
 }
 

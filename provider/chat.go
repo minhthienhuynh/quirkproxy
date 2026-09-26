@@ -11,10 +11,15 @@ import (
 	"syscall"
 )
 
-// ChatMessage is one OpenAI-style chat message.
+// ChatMessage is one OpenAI-style chat message. ToolCalls carries the calls
+// an assistant turn requested (request history) and ToolCallID links a
+// role:"tool" result to the call it answers, so a protocol fallback can
+// preserve the multi-turn tool loop instead of flattening it.
 type ChatMessage struct {
-	Role    string
-	Content string
+	Role       string
+	Content    string
+	ToolCalls  []ToolCall
+	ToolCallID string
 }
 
 // ChatTool is one function tool in provider-neutral form.

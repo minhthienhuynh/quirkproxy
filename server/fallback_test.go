@@ -446,3 +446,75 @@ func TestChatFallbackFailedPayloadSurfacesUpstreamError(t *testing.T) {
 		t.Fatalf("message = %v, want verbatim upstream message", errObj["message"])
 	}
 }
+
+// Task 3.1: agentic tool loop keeps full history through the chat->responses
+// fallback — the backend sees cumulative function_call/function_call_output
+// items each turn (so the model does not re-run prior tools), unlike the old
+// flat "role: content" string.
+func TestFallbackToolLoopKeepsHistory(t *testing.T) {
+	fake := dualFixture()
+	app := New(chatReg(t, fake), testLogger())
+
+	toolCalls := func(id, name, args string) []any {
+		return []any{map[string]any{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": args}}}
+	}
+	// Turn 1: user prompt only.
+	postChat(t, app, map[string]any{"model": "resp-m", "messages": []any{
+		map[string]any{"role": "user", "content": "add gemini"},
+	}})
+	// Turn 2: + call_1 + its result.
+	postChat(t, app, map[string]any{"model": "resp-m", "messages": []any{
+		map[string]any{"role": "user", "content": "add gemini"},
+		map[string]any{"role": "assistant", "tool_calls": toolCalls("call_1", "read", `{"filePath":"c.json"}`)},
+		map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "{cfg}"},
+	}})
+	// Turn 3: + call_2 + its result — backend must now see BOTH calls + results.
+	postChat(t, app, map[string]any{"model": "resp-m", "messages": []any{
+		map[string]any{"role": "user", "content": "add gemini"},
+		map[string]any{"role": "assistant", "tool_calls": toolCalls("call_1", "read", `{"filePath":"c.json"}`)},
+		map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "{cfg}"},
+		map[string]any{"role": "assistant", "tool_calls": toolCalls("call_2", "bash", `{"command":"curl"}`)},
+		map[string]any{"role": "tool", "tool_call_id": "call_2", "content": "{out}"},
+	}})
+
+	items, ok := fake.lastResp.Input.([]any)
+	if !ok {
+		t.Fatalf("final input = %T, want []any structured items (not flat string)", fake.lastResp.Input)
+	}
+	callIDs, outIDs := map[string]bool{}, map[string]bool{}
+	for _, it := range items {
+		m := it.(map[string]any)
+		switch m["type"] {
+		case "function_call":
+			callIDs[m["call_id"].(string)] = true
+		case "function_call_output":
+			outIDs[m["call_id"].(string)] = true
+		}
+	}
+	if len(callIDs) != 2 || len(outIDs) != 2 {
+		t.Fatalf("final history calls=%d outputs=%d, want 2/2 (history kept)", len(callIDs), len(outIDs))
+	}
+	for id := range outIDs {
+		if !callIDs[id] {
+			t.Fatalf("output %q has no matching call in history", id)
+		}
+	}
+}
+
+// Task 3.2 back-compat: a single text request still maps to a plain string
+// input and the fallback succeeds.
+func TestFallbackSingleTextBackCompat(t *testing.T) {
+	fake := dualFixture()
+	app := New(chatReg(t, fake), testLogger())
+
+	code, got := postChat(t, app, map[string]any{
+		"model":    "resp-m",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if code != 200 {
+		t.Fatalf("status = %d, got %v", code, got)
+	}
+	if s, ok := fake.lastResp.Input.(string); !ok || s != "hi" {
+		t.Fatalf("input = %#v, want string \"hi\"", fake.lastResp.Input)
+	}
+}

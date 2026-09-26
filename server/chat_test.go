@@ -458,3 +458,34 @@ func TestChatStreamUpstreamError(t *testing.T) {
 		t.Fatalf("status = %d, want 429 passthrough", resp.StatusCode)
 	}
 }
+
+// Task 1.2: the handler parses tool_calls and tool_call_id from the request
+// wire into provider.ChatMessage so a fallback can preserve the tool loop.
+func TestChatRequestParsesToolHistory(t *testing.T) {
+	fake := dualFixture()
+	app := New(chatReg(t, fake), testLogger())
+
+	postChat(t, app, map[string]any{
+		"model": "chat-m",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "add gemini"},
+			map[string]any{"role": "assistant", "content": "checking", "tool_calls": []any{
+				map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "read", "arguments": `{"filePath":"c.json"}`}},
+				map[string]any{"id": "call_2", "type": "function", "function": map[string]any{"name": "bash", "arguments": `{"command":"curl"}`}},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "{cfg}"},
+			map[string]any{"role": "tool", "tool_call_id": "call_2", "content": "{out}"},
+		},
+	})
+
+	msgs := fake.lastChat.Messages
+	if len(msgs) != 4 {
+		t.Fatalf("messages = %d, want 4", len(msgs))
+	}
+	if len(msgs[1].ToolCalls) != 2 || msgs[1].ToolCalls[0].Name != "read" || msgs[1].ToolCalls[1].ID != "call_2" {
+		t.Fatalf("assistant ToolCalls not parsed: %+v", msgs[1].ToolCalls)
+	}
+	if msgs[2].ToolCallID != "call_1" || msgs[3].ToolCallID != "call_2" {
+		t.Fatalf("ToolCallID not parsed: %q / %q", msgs[2].ToolCallID, msgs[3].ToolCallID)
+	}
+}

@@ -9,20 +9,24 @@ import (
 )
 
 // chatToResponses maps a normalized chat request to a Responses request.
-// Single messages keep plain text; multi-turn joins "role: content" lines.
-// tool_choice/temperature are dropped: the Responses wire has no equivalent.
-// Callers guarantee at least one message (the chat handler rejects empty
-// requests with 400); an empty request maps to empty input.
+// Multi-turn history keeps its structure as Responses input items so the
+// agentic tool loop survives the fallback: assistant text -> message item,
+// assistant tool_calls -> function_call items, role:"tool" results ->
+// function_call_output items, turn order preserved. A lone text message maps
+// to a plain input string (back-compat). tool_choice/temperature are dropped:
+// the Responses wire has no equivalent. Callers guarantee at least one
+// message (the chat handler rejects empty requests with 400).
 func chatToResponses(req provider.ChatRequest) provider.ResponsesRequest {
-	var input string
-	if len(req.Messages) == 1 {
+	var input any
+	if len(req.Messages) == 1 && req.Messages[0].Role == "user" &&
+		len(req.Messages[0].ToolCalls) == 0 && req.Messages[0].ToolCallID == "" {
 		input = req.Messages[0].Content
 	} else {
-		lines := make([]string, 0, len(req.Messages))
+		items := make([]any, 0, len(req.Messages))
 		for _, m := range req.Messages {
-			lines = append(lines, m.Role+": "+m.Content)
+			items = append(items, chatMessageToInputItems(m)...)
 		}
-		input = strings.Join(lines, "\n")
+		input = items
 	}
 	out := provider.ResponsesRequest{Model: req.Model, Input: input}
 	for _, t := range req.Tools {
@@ -32,6 +36,39 @@ func chatToResponses(req provider.ChatRequest) provider.ResponsesRequest {
 	}
 	out.MaxOutputTokens = req.MaxTokens
 	return out
+}
+
+// chatMessageToInputItems expands one chat message into Responses input items,
+// matching the genuine client shape (no explicit "message" type; user content
+// is an input_text array while assistant/system content is a plain string):
+// a tool result becomes a function_call_output, an assistant turn becomes a
+// message item plus one function_call per call (call_id only — never an item
+// id), and any other text becomes a message item.
+func chatMessageToInputItems(m provider.ChatMessage) []any {
+	if m.ToolCallID != "" && len(m.ToolCalls) == 0 {
+		return []any{map[string]any{
+			"type": "function_call_output", "call_id": m.ToolCallID, "output": m.Content,
+		}}
+	}
+	var items []any
+	if m.Content != "" {
+		role := m.Role
+		if role == "" {
+			role = "user"
+		}
+		var content any = m.Content
+		if role == "user" {
+			content = []any{map[string]any{"type": "input_text", "text": m.Content}}
+		}
+		items = append(items, map[string]any{"role": role, "content": content})
+	}
+	for _, tc := range m.ToolCalls {
+		items = append(items, map[string]any{
+			"type": "function_call", "call_id": tc.ID,
+			"name": tc.Name, "arguments": tc.Arguments,
+		})
+	}
+	return items
 }
 
 // responsesToChat maps a normalized Responses request to a chat request.

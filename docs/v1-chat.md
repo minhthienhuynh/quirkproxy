@@ -31,7 +31,7 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
 | Direction | Map |
 |---|---|
 | `model` | must be in the free allowlist, else 404 before upstream |
-| `messages[]` | `role`/`content` verbatim on the direct path; via fallback a single message keeps plain text, multi-turn joins `role: content` lines |
+| `messages[]` | `role`/`content` verbatim on the direct path; via fallback a single text message maps to a plain string input, while multi-turn history maps to structured Responses items preserving the tool loop — message items (role + content, user content as `input_text` parts), `tool_calls` → `function_call` items, `role:"tool"` results → `function_call_output` items (call_id linkage kept) |
 | `tools[]` | OpenAI function shape verbatim + gate entries ensured (mapped 1-1 through fallback) |
 | `tool_choice`, `temperature`, `max_tokens` | verbatim when present on the direct path; `tool_choice`/`temperature` are dropped on the fallback path (responses wire has no equivalent), `max_tokens` maps to `max_output_tokens`; a truncated responses payload (`status:"incomplete"`) keeps its partial output — empty content when the cut landed before any usable output — and reports `finish_reason: length`, or `content_filter` when its `incomplete_details.reason` is `content_filter` |
 | `stream:true` | SSE relay: envelope rewritten, deltas verbatim, single proxy-emitted `[DONE]` |
@@ -102,6 +102,9 @@ empty, or non-positive):
 - Truncation before any usable output (empty/reasoning-only) returns empty content + `finish_reason` instead of 502: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteEmptyOutput`
 - Payload `status` → chat `finish_reason` translation: `server/translate_test.go` → `TestTranslateResponsesPayloadIncompleteFinishReason` (incl. `content_filter`), `TestTranslateResponsesPayloadFailedErrors`
 - Failed payload surfaces the upstream error unwrapped (502 `UpstreamResponseFailed`): `server/fallback_test.go` → `TestChatFallbackFailedPayloadSurfacesUpstreamError`
+- Fallback preserves the multi-turn tool loop as structured input items (not a flat string): `server/translate_test.go` → `TestChatToResponsesPreservesToolLoop`, `server/fallback_test.go` → `TestFallbackToolLoopKeepsHistory`
+- Single text message still maps to a plain string input: `server/translate_test.go` → `TestChatToResponsesSingleTextBackCompat`, `server/fallback_test.go` → `TestFallbackSingleTextBackCompat`
+- Request parses `tool_calls`/`tool_call_id` into the normalized messages: `server/chat_test.go` → `TestChatRequestParsesToolHistory`
 - Inference client has no total timeout + generation bound (headers vs body): `provider/opencode/timeout_test.go` → `TestInferenceAndCatalogClientBounds`, `TestPostToPathGenerationBound`
 - Transport/timeout error classification: `provider/chat_test.go` → `TestClassifyTransportError`
 - Typed `UpstreamTimeout`/`UpstreamTransport` surfacing (not the catch-all): `server/upstream_error_test.go`

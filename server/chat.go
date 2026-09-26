@@ -30,6 +30,11 @@ type chatRequest struct {
 type chatMessage struct {
 	Role    string         `json:"role"`
 	Content messageContent `json:"content"`
+	// ToolCalls are the calls an assistant turn requested; ToolCallID links
+	// a role:"tool" result to the call it answers. Parsed so the fallback can
+	// preserve the multi-turn tool loop.
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // messageContent accepts a plain string or an array of content parts
@@ -78,12 +83,14 @@ type chatChoice struct {
 }
 
 type chatReply struct {
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	ToolCalls []replyToolCall `json:"tool_calls,omitempty"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 }
 
-type replyToolCall struct {
+// toolCall is the OpenAI function tool-call wire shape, shared by request
+// history (assistant turns) and replies.
+type toolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -216,7 +223,7 @@ func chatFinishReason(res provider.ChatResult) string {
 func writeChatResponse(c fiber.Ctx, model string, res provider.ChatResult) error {
 	reply := chatReply{Role: "assistant", Content: res.Content}
 	for _, tc := range res.ToolCalls {
-		var rtc replyToolCall
+		var rtc toolCall
 		rtc.ID, rtc.Type = tc.ID, "function"
 		rtc.Function.Name, rtc.Function.Arguments = tc.Name, tc.Arguments
 		reply.ToolCalls = append(reply.ToolCalls, rtc)
@@ -241,7 +248,11 @@ func chatHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
 		}
 		chatReq := provider.ChatRequest{Model: req.Model, ToolChoice: req.ToolChoice, Temperature: req.Temperature, MaxTokens: req.MaxTokens}
 		for _, m := range req.Messages {
-			chatReq.Messages = append(chatReq.Messages, provider.ChatMessage{Role: m.Role, Content: m.Content.Text})
+			cm := provider.ChatMessage{Role: m.Role, Content: m.Content.Text, ToolCallID: m.ToolCallID}
+			for _, tc := range m.ToolCalls {
+				cm.ToolCalls = append(cm.ToolCalls, provider.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+			}
+			chatReq.Messages = append(chatReq.Messages, cm)
 		}
 		for _, t := range req.Tools {
 			chatReq.Tools = append(chatReq.Tools, provider.ChatTool{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})

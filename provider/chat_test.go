@@ -87,3 +87,29 @@ func TestClassifyTransportErrorThroughWraps(t *testing.T) {
 		t.Fatalf("got %v (%T), want UpstreamTimeout", got, got)
 	}
 }
+
+// Task 1.1: ChatMessage carries tool-call/tool-result structure so a fallback
+// translation can preserve the multi-turn tool loop.
+func TestChatMessageToolStructure(t *testing.T) {
+	req := ChatRequest{
+		Model: "m",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "add gemini"},
+			{Role: "assistant", Content: "checking", ToolCalls: []ToolCall{
+				{ID: "call_1", Name: "read", Arguments: `{"filePath":"config.json"}`},
+				{ID: "call_2", Name: "bash", Arguments: `{"command":"curl"}`},
+			}},
+			{Role: "tool", ToolCallID: "call_1", Content: "{config content}"},
+			{Role: "tool", ToolCallID: "call_2", Content: "{curl output}"},
+		},
+	}
+	if len(req.Messages[1].ToolCalls) != 2 {
+		t.Fatalf("assistant ToolCalls = %d, want 2", len(req.Messages[1].ToolCalls))
+	}
+	if req.Messages[1].ToolCalls[0].ID != "call_1" || req.Messages[1].ToolCalls[1].Name != "bash" {
+		t.Fatalf("ToolCalls not preserved: %+v", req.Messages[1].ToolCalls)
+	}
+	if req.Messages[2].ToolCallID != "call_1" || req.Messages[3].ToolCallID != "call_2" {
+		t.Fatalf("ToolCallID not preserved: %q / %q", req.Messages[2].ToolCallID, req.Messages[3].ToolCallID)
+	}
+}
