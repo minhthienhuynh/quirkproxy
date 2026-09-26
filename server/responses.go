@@ -140,8 +140,10 @@ func serveResponsesFallback(c fiber.Ctx, logger *slog.Logger, p provider.ModelLi
 // relayResponsesStream relays the upstream SSE stream, preserving event:
 // lines and rewriting only the envelope (id/model/created_at) inside data
 // JSON response objects. The upstream response.completed is swallowed and
-// exactly one proxy-emitted response.completed ends the stream. A scanner
-// failure closes the stream without a fake completed.
+// exactly one proxy-emitted response.completed ends the stream — unless the
+// stream ends on a relayed response.incomplete/response.failed, which
+// terminates it directly. A scanner failure closes the stream without a
+// fake completed.
 func relayResponsesStream(c fiber.Ctx, logger *slog.Logger, rc provider.ResponsesCompleter, req provider.ResponsesRequest, model string) error {
 	raw, err := rc.ResponsesRaw(c.Context(), req)
 	if err != nil {

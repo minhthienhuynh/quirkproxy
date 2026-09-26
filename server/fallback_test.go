@@ -368,3 +368,81 @@ func TestResponsesFallbackEmptyInput400(t *testing.T) {
 		t.Fatal("upstream chat must not be touched on 400")
 	}
 }
+
+func TestChatFallbackIncompleteKeepsTruncatedOutput(t *testing.T) {
+	fake := dualFixture()
+	fake.respRes = provider.ResponsesResult{Payload: []byte(
+		`{"id":"resp-up","object":"response","model":"resp-m","created_at":1,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}`)}
+	app := New(chatReg(t, fake), testLogger())
+
+	code, got := postChat(t, app, map[string]any{
+		"model":    "resp-m",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (incomplete truncation must not 502), got %v", code, got)
+	}
+	choices, _ := got["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices = %v", got["choices"])
+	}
+	ch, _ := choices[0].(map[string]any)
+	msg, _ := ch["message"].(map[string]any)
+	if msg["content"] != "partial answer" {
+		t.Fatalf("content = %v, want partial answer", msg["content"])
+	}
+	if ch["finish_reason"] != "length" {
+		t.Fatalf("finish_reason = %v, want length", ch["finish_reason"])
+	}
+}
+
+func TestChatFallbackIncompleteStreamFinishReason(t *testing.T) {
+	fake := dualFixture()
+	fake.respRes = provider.ResponsesResult{Payload: []byte(
+		`{"id":"resp-up","object":"response","model":"resp-m","created_at":1,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}`)}
+	app := New(chatReg(t, fake), testLogger())
+
+	raw, _ := json.Marshal(map[string]any{
+		"model": "resp-m", "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"finish_reason":"length"`) {
+		t.Fatalf("missing finish_reason length in stream: %q", body)
+	}
+	if !strings.Contains(string(body), `"partial answer"`) {
+		t.Fatalf("missing partial content in stream: %q", body)
+	}
+}
+
+func TestChatFallbackFailedPayloadSurfacesUpstreamError(t *testing.T) {
+	fake := dualFixture()
+	fake.respRes = provider.ResponsesResult{Payload: []byte(
+		`{"id":"resp-up","object":"response","model":"resp-m","created_at":1,"status":"failed","error":{"message":"quota exhausted"},"output":[]}`)}
+	app := New(chatReg(t, fake), testLogger())
+
+	code, got := postChat(t, app, map[string]any{
+		"model":    "resp-m",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, got %v", code, got)
+	}
+	errObj, _ := got["error"].(map[string]any)
+	if errObj["type"] != "UpstreamResponseFailed" {
+		t.Fatalf("type = %v, want UpstreamResponseFailed (not wrapped as TranslateError)", errObj["type"])
+	}
+	if errObj["message"] != "quota exhausted" {
+		t.Fatalf("message = %v, want verbatim upstream message", errObj["message"])
+	}
+}

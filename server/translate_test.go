@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -119,7 +120,7 @@ func TestTranslateChatResultToResponsesPayload(t *testing.T) {
 }
 
 func TestSynthesizeChatSSE(t *testing.T) {
-	sse := synthesizeChatSSE("Hi", nil, "m", "chatcmpl-x", 99)
+	sse := synthesizeChatSSE(provider.ChatResult{Content: "Hi"}, "m", "chatcmpl-x", 99)
 	if !strings.Contains(sse, `"content":"Hi"`) {
 		t.Fatalf("missing content: %q", sse)
 	}
@@ -146,3 +147,66 @@ func TestSynthesizeResponsesSSE(t *testing.T) {
 }
 
 func intPtr(v int) *int { return &v }
+
+func TestTranslateResponsesPayloadIncompleteFinishReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		details string
+		want    string
+	}{
+		{"max_output_tokens truncation", `"incomplete_details":{"reason":"max_output_tokens"}`, "length"},
+		{"content_filter cut", `"incomplete_details":{"reason":"content_filter"}`, "content_filter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := []byte(`{"id":"resp-x","model":"m","status":"incomplete",` + tt.details + `,"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`)
+			res, err := responsesPayloadToChatResult(payload)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if res.Content != "partial" {
+				t.Fatalf("content = %q, want partial output kept", res.Content)
+			}
+			if res.FinishReason != tt.want {
+				t.Fatalf("finish = %q, want %q", res.FinishReason, tt.want)
+			}
+		})
+	}
+}
+
+func TestTranslateResponsesPayloadIncompleteEmptyOutput(t *testing.T) {
+	for _, payload := range []string{
+		`{"id":"resp-x","model":"m","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`,
+		`{"id":"resp-x","model":"m","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","id":"rs_1"}]}`,
+	} {
+		res, err := responsesPayloadToChatResult([]byte(payload))
+		if err != nil {
+			t.Fatalf("truncation without usable output must not error: %s (%v)", payload, err)
+		}
+		if res.Content != "" || len(res.ToolCalls) != 0 {
+			t.Fatalf("result = %+v, want empty content and no tool calls", res)
+		}
+		if res.FinishReason != "length" {
+			t.Fatalf("finish = %q, want length", res.FinishReason)
+		}
+	}
+}
+
+func TestTranslateResponsesPayloadFailedErrors(t *testing.T) {
+	payload := []byte(`{"id":"resp-x","model":"m","status":"failed","error":{"message":"quota exhausted"},"output":[]}`)
+	_, err := responsesPayloadToChatResult(payload)
+	var ue *provider.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v, want UpstreamError", err)
+	}
+	if ue.Message != "quota exhausted" {
+		t.Fatalf("message = %q, want upstream message", ue.Message)
+	}
+}
+
+func TestSynthesizeChatSSETruncationFinishReason(t *testing.T) {
+	sse := synthesizeChatSSE(provider.ChatResult{Content: "cut", FinishReason: "length"}, "m", "chatcmpl-y", 99)
+	if !strings.Contains(sse, `"finish_reason":"length"`) {
+		t.Fatalf("missing finish_reason length: %q", sse)
+	}
+}

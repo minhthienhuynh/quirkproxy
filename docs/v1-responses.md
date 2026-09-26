@@ -7,12 +7,15 @@ touching upstream. Models whose `endpoint` is `chat/completions`
 are served here too via protocol fallback: the proxy calls the chat
 backend and builds a Responses payload back. The proxy always calls upstream with `stream:true` (gate
 requirement): non-stream requests get the buffered full response (waits for
-`response.completed`, returns the response object with envelope rewritten);
+a terminal event — `response.completed`, or `response.incomplete` when the
+model hits `max_output_tokens`; returns the response object with envelope
+rewritten; `response.failed` surfaces as 502 with the upstream message);
 `stream:true` requests get the SSE stream relayed with `event:` lines preserved,
 envelope (`id`/`model`/`created_at`) rewritten inside `response` objects,
 output items passed through byte-identical, terminated by exactly one
 `event: response.completed` (emitted by the proxy; an upstream
-`response.completed` is swallowed).
+`response.completed` is swallowed) — unless the stream ends on a relayed
+`response.incomplete`/`response.failed`, which terminates it directly.
 Fallback streams (`stream:true` with a chat-endpoint model) are
 buffered instead: `response.created` plus a single proxy-emitted
 `response.completed`.
@@ -32,7 +35,7 @@ One recipe covers both endpoints; a change to the recipe applies to both.
 | `reasoning` | verbatim when present on the direct path; dropped on the fallback path (chat wire has no equivalent) |
 | `max_output_tokens` | verbatim when present on the direct path; maps to `max_tokens` on the fallback path |
 | `stream:true` | SSE relay: `event:` lines preserved, envelope rewritten in `response` objects, output items byte-identical, single proxy-emitted `response.completed` |
-| `stream:false` | proxy calls upstream `stream:true`, waits for `response.completed`, returns the response object with envelope rewritten |
+| `stream:false` | proxy calls upstream `stream:true`, waits for a terminal event (`response.completed` or `response.incomplete`), returns the response object with envelope rewritten; `response.failed` → 502 with the upstream message |
 | response envelope | `id` (proxy-generated `resp_` + 26 base62), `model`, `created_at` rewritten; `object`, `status`, `output[]` and all other fields pass through |
 
 ## SSE event types
@@ -47,6 +50,8 @@ One recipe covers both endpoints; a change to the recipe applies to both.
 | `response.output_text.delta` | relayed as-is |
 | `response.content_part.done` | relayed as-is |
 | `response.completed` | swallowed; exactly one proxy-emitted `response.completed` ends the stream |
+| `response.incomplete` | relayed (envelope rewritten); terminal — ends the stream (truncation: `incomplete_details.reason` is `max_output_tokens` or `content_filter`) |
+| `response.failed` | relayed (envelope rewritten); terminal — ends the stream |
 | `ping` | relayed as-is |
 
 Output items (`reasoning`, `function_call`, `message`) pass through
@@ -68,6 +73,7 @@ rejection: a model served by the other protocol is translated, not refused.
 | Unknown/disabled provider (scoped route) | 404 |
 | Model owned by a provider that cannot serve its endpoint | 502 MisconfiguredProvider |
 | Upstream 4xx | verbatim status + message (403 + hint) |
+| Upstream `response.failed` (buffered) | 502 UpstreamResponseFailed + upstream message |
 | No cache + dead upstream (allowlist) | 503 |
 | Usable cache + dead upstream (allowlist) | 502 |
 
@@ -90,7 +96,9 @@ Upstream `retry-after` (or `retry-after-ms`) on 429/503 is forwarded as a
 - Field passthrough (input/reasoning/max_output_tokens): `TestResponsesFieldPassthrough`
 - Non-stream aggregation + reasoning item pass-through: `TestResponsesAggregation`
 - 403+hint / 401 passthrough, no 4xx retry: `TestResponsesUpstreamErrors`
-- Missing `response.completed` → error: `TestResponsesNoCompletedEvent`
+- No terminal event → error: `TestResponsesNoCompletedEvent`
+- Terminal `response.incomplete` folds (truncation kept, envelope rewritten, output + `incomplete_details` pass-through): `TestResponsesIncompleteEventFolds`
+- `response.failed` → 502 with the upstream message: `TestResponsesFailedEventSurfacesError`
 - Handler (non-stream, stream relay, 404, 403, 503, scoped): `server/responses_test.go`
 - Protocol fallback (responses calling chat models, buffered stream): `server/fallback_test.go` → `TestResponsesFallbackToChat`
 - Watchdog responses probe + gate-change detection: `provider/watch_test.go` → `TestWatchRecipeResponsesGateChange`
