@@ -86,3 +86,8 @@ one registration line. No reflection, no plugins.
 - No auth on the proxy itself — bind `127.0.0.1` unless you
   put it behind a reverse proxy with TLS.
 - Logs go to stderr (slog text).
+
+## Deployment
+
+Push `main` to trigger CI (gates → GHCR image → Dokploy deploy).
+See `docs/deploy.md` for prerequisites and security notes.

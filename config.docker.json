@@ -1,0 +1,26 @@
+{
+  "listen": "0.0.0.0:8080",
+  "providers": [
+    {
+      "id": "opencode",
+      "type": "opencode",
+      "enabled": true,
+      "blacklist": [],
+      "whitelist": [],
+      "refresh_ttl": "1h",
+      "refresh": {
+        "zen": "1h",
+        "models_dev": "12h"
+      },
+      "max_cache_age": "24h",
+      "options": {
+        "zen_models_url": "https://opencode.ai/zen/v1/models",
+        "models_dev_url": "https://models.dev/api.json",
+        "zen_api_url": "https://opencode.ai/zen/v1",
+        "user_agent": "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2",
+        "client": "cli",
+        "project": "global"
+      }
+    }
+  ]
+}
