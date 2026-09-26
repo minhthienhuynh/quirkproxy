@@ -199,3 +199,37 @@ func TestChatRawConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestUpstreamErrorCapturesRetryAfter(t *testing.T) {
+	cases := []struct {
+		name   string
+		header map[string]string
+		want   string
+	}{
+		{"retry-after", map[string]string{"Retry-After": "120"}, "120"},
+		{"retry-after-ms", map[string]string{"retry-after-ms": "2500"}, "2500"},
+		{"absent", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				for k, v := range tc.header {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"type":"RateLimit","message":"slow"}}`))
+			}))
+			defer srv.Close()
+			c := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+			_, err := c.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
+			var uerr *provider.UpstreamError
+			if !errors.As(err, &uerr) {
+				t.Fatalf("err type = %T, want *UpstreamError", err)
+			}
+			if uerr.RetryAfter != tc.want {
+				t.Fatalf("RetryAfter = %q, want %q", uerr.RetryAfter, tc.want)
+			}
+		})
+	}
+}

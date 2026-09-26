@@ -321,6 +321,11 @@ func parseUpstreamError(resp *http.Response) error {
 		msg = envelope.Error.Message
 	}
 	uerr := &provider.UpstreamError{Status: resp.StatusCode, Type: envelope.Error.Type, Message: msg}
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		uerr.RetryAfter = ra
+	} else if ms := resp.Header.Get("retry-after-ms"); ms != "" {
+		uerr.RetryAfter = ms
+	}
 	if resp.StatusCode == 403 {
 		uerr.Hint = "check pinned User-Agent recipe"
 	}

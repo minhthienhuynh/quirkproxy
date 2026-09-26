@@ -46,6 +46,9 @@ type UpstreamError struct {
 	Type    string
 	Message string
 	Hint    string
+	// RetryAfter carries an upstream retry-after (or retry-after-ms) value
+	// so handlers can forward it as a Retry-After response header.
+	RetryAfter string
 }
 
 // Error implements error.

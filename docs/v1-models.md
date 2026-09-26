@@ -29,7 +29,7 @@ data age in seconds.
 | `quirk.status` | `"active"` after filtering (deprecated already dropped; alpha kept like CLI) |
 | `quirk.family` | models.dev `family` |
 | `quirk.transport` | `model.provider.npm ?? provider.npm ?? "@ai-sdk/openai-compatible"` (per CLI) |
-| `quirk.endpoint` | `"responses"` when transport is `@ai-sdk/openai`, otherwise `"chat/completions"` (Zen-specific; other providers define their own) |
+| `quirk.endpoint` | `"responses"` when transport is `@ai-sdk/openai`, otherwise `"chat/completions"` (Zen-specific; other providers define their own). Both `/v1/chat/completions` and `/v1/responses` serve either endpoint via protocol fallback, so clients may ignore this field for routing and use it only for debugging |
 
 ## Filtering (CLI mirror, fail-closed)
 

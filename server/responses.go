@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -33,14 +32,26 @@ type responsesWireTool struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// findResponsesProvider wraps findProvider for the Responses API.
-func findResponsesProvider(ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string) (provider.ResponsesCompleter, error) {
-	return findProvider(ctx, reg, logger, modelID, filter,
-		provider.CapabilityResponses, "responses", "responses",
+// serveResponsesDirect serves a responses-endpoint model straight through
+// the Responses backend, relaying streams envelope-rewritten.
+func serveResponsesDirect(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister, filter string, req responsesRequest, respReq provider.ResponsesRequest) error {
+	rc, err := completerOf(p, filter, provider.CapabilityResponses, "responses",
 		func(p provider.ModelLister) (provider.ResponsesCompleter, bool) {
 			rc, ok := p.(provider.ResponsesCompleter)
 			return rc, ok
 		})
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	if req.Stream {
+		return relayResponsesStream(c, logger, rc, respReq, req.Model)
+	}
+	res, err := rc.Responses(c.Context(), respReq)
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	c.Set("Content-Type", "application/json")
+	return c.Send(res.Payload)
 }
 
 // responsesHandler serves POST /v1/responses and
@@ -57,10 +68,6 @@ func responsesHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler
 		if req.Input == nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
 		}
-		rc, err := findResponsesProvider(c.Context(), reg, logger, req.Model, c.Params("provider", ""))
-		if err != nil {
-			return chatUpstreamError(c, logger, req.Model, err)
-		}
 		respReq := provider.ResponsesRequest{
 			Model:           req.Model,
 			Input:           req.Input,
@@ -72,16 +79,62 @@ func responsesHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler
 				Name: t.Name, Description: t.Description, Parameters: t.Parameters,
 			})
 		}
-		if req.Stream {
-			return relayResponsesStream(c, logger, rc, respReq, req.Model)
-		}
-		res, err := rc.Responses(c.Context(), respReq)
+		filter := c.Params("provider", "")
+		p, m, err := resolveModel(c.Context(), reg, logger, req.Model, filter)
 		if err != nil {
 			return chatUpstreamError(c, logger, req.Model, err)
 		}
-		c.Set("Content-Type", "application/json")
-		return c.Send(res.Payload)
+		endpoint := m.Endpoint
+		if endpoint == "" {
+			endpoint = "responses"
+		}
+		switch endpoint {
+		case "responses":
+			return serveResponsesDirect(c, logger, p, filter, req, respReq)
+		case "chat/completions":
+			return serveResponsesFallback(c, logger, p, filter, req, respReq)
+		default:
+			return chatUpstreamError(c, logger, req.Model, &provider.UpstreamError{
+				Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider",
+				Message: "model " + req.Model + " serves unknown endpoint " + m.Endpoint,
+			})
+		}
 	}
+}
+
+// serveResponsesFallback serves a chat-endpoint model through the Responses
+// API: it calls the chat backend (buffered non-stream) and builds a
+// Responses payload back.
+func serveResponsesFallback(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister, filter string, req responsesRequest, respReq provider.ResponsesRequest) error {
+	cc, err := completerOf(p, filter, provider.CapabilityChat, "chat",
+		func(p provider.ModelLister) (provider.ChatCompleter, bool) {
+			cc, ok := p.(provider.ChatCompleter)
+			return cc, ok
+		})
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	logger.Info("protocol fallback", "model", req.Model,
+		"from_endpoint", "responses", "to_endpoint", "chat/completions", "buffered", req.Stream)
+	if respReq.Reasoning != nil {
+		logger.Warn("protocol fallback dropping unsupported fields", "model", req.Model, "dropped_fields", "reasoning")
+	}
+	chatReq := responsesToChat(respReq)
+	if len(chatReq.Messages) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot map responses input to chat messages"})
+	}
+	res, err := cc.Chat(c.Context(), chatReq)
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	id, created := newResponsesID(), time.Now().Unix()
+	payload := chatResultToResponsesPayload(res, req.Model, id, created)
+	if req.Stream {
+		setSSEHeaders(c)
+		return c.SendString(synthesizeResponsesSSE(payload, req.Model, id, created))
+	}
+	c.Set("Content-Type", "application/json")
+	return c.Send(payload)
 }
 
 // relayResponsesStream relays the upstream SSE stream, preserving event:
@@ -94,9 +147,7 @@ func relayResponsesStream(c fiber.Ctx, logger *slog.Logger, rc provider.Response
 	if err != nil {
 		return chatUpstreamError(c, logger, model, err)
 	}
-	c.Set("Content-Type", "text/event-stream")
-	c.Set("Cache-Control", "no-cache")
-	c.Set("Connection", "keep-alive")
+	setSSEHeaders(c)
 	id, created := newResponsesID(), time.Now().Unix()
 	c.Response().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer raw.Close()

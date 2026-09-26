@@ -1,9 +1,11 @@
 # POST /v1/responses and POST /:provider/v1/responses
 
-Responses API over Zen free models (currently `muse-spark-1.3-contributor-free`).
+Responses API over free models (currently `muse-spark-1.3-contributor-free`).
 The scoped endpoint (e.g. `/opencode/v1/responses`) restricts to that provider:
 unknown/disabled provider or model outside its allowlist → 404 without
-touching upstream. The proxy always calls upstream with `stream:true` (gate
+touching upstream. Models whose `endpoint` is `chat/completions`
+are served here too via protocol fallback: the proxy calls the chat
+backend and builds a Responses payload back. The proxy always calls upstream with `stream:true` (gate
 requirement): non-stream requests get the buffered full response (waits for
 `response.completed`, returns the response object with envelope rewritten);
 `stream:true` requests get the SSE stream relayed with `event:` lines preserved,
@@ -11,6 +13,9 @@ envelope (`id`/`model`/`created_at`) rewritten inside `response` objects,
 output items passed through byte-identical, terminated by exactly one
 `event: response.completed` (emitted by the proxy; an upstream
 `response.completed` is swallowed).
+Fallback streams (`stream:true` with a chat-endpoint model) are
+buffered instead: `response.created` plus a single proxy-emitted
+`response.completed`.
 
 ## Recipe (shared with chat, pinned genuine markers, verified live)
 
@@ -22,10 +27,10 @@ One recipe covers both endpoints; a change to the recipe applies to both.
 | Direction | Map |
 |---|---|
 | `model` | must be in the free allowlist, else 404 before upstream |
-| `input` | string or items array, passed through verbatim |
-| `tools[]` | Responses function shape (`{type:"function",name,description,parameters}`) verbatim + gate entries (`bash`, `read`) ensured |
-| `reasoning` | verbatim when present |
-| `max_output_tokens` | verbatim when present |
+| `input` | string or items array, passed through verbatim on the direct path; via fallback a string becomes one user message, an array maps message/input_text items keeping role |
+| `tools[]` | Responses function shape (`{type:"function",name,description,parameters}`) verbatim + gate entries (`bash`, `read`) ensured (mapped 1-1 through fallback) |
+| `reasoning` | verbatim when present on the direct path; dropped on the fallback path (chat wire has no equivalent) |
+| `max_output_tokens` | verbatim when present on the direct path; maps to `max_tokens` on the fallback path |
 | `stream:true` | SSE relay: `event:` lines preserved, envelope rewritten in `response` objects, output items byte-identical, single proxy-emitted `response.completed` |
 | `stream:false` | proxy calls upstream `stream:true`, waits for `response.completed`, returns the response object with envelope rewritten |
 | response envelope | `id` (proxy-generated `resp_` + 26 base62), `model`, `created_at` rewritten; `object`, `status`, `output[]` and all other fields pass through |
@@ -54,14 +59,20 @@ Upstream status and message pass through verbatim in
 `{error:{message,type,code,hint?}}`; 403 carries `hint: check pinned
 User-Agent recipe`. No retry on 4xx. No cache + dead upstream on the
 allowlist lookup behaves like `GET /v1/models` (503).
+Fallback errors pass through the same way. There is no `WrongEndpoint`
+rejection: a model served by the other protocol is translated, not refused.
 
 | Situation | HTTP |
 |---|---|
 | Model not in free allowlist | 404 before upstream |
 | Unknown/disabled provider (scoped route) | 404 |
+| Model owned by a provider that cannot serve its endpoint | 502 MisconfiguredProvider |
 | Upstream 4xx | verbatim status + message (403 + hint) |
 | No cache + dead upstream (allowlist) | 503 |
 | Usable cache + dead upstream (allowlist) | 502 |
+
+Upstream `retry-after` (or `retry-after-ms`) on 429/503 is forwarded as a
+`Retry-After` response header.
 
 ## Notes
 
@@ -81,4 +92,5 @@ allowlist lookup behaves like `GET /v1/models` (503).
 - 403+hint / 401 passthrough, no 4xx retry: `TestResponsesUpstreamErrors`
 - Missing `response.completed` → error: `TestResponsesNoCompletedEvent`
 - Handler (non-stream, stream relay, 404, 403, 503, scoped): `server/responses_test.go`
+- Protocol fallback (responses calling chat models, buffered stream): `server/fallback_test.go` → `TestResponsesFallbackToChat`
 - Watchdog responses probe + gate-change detection: `provider/watch_test.go` → `TestWatchRecipeResponsesGateChange`

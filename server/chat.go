@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -109,116 +108,6 @@ func newResponseID() string {
 	return "chatcmpl-" + hex.EncodeToString(b[:])
 }
 
-// findProvider resolves the enabled provider serving modelID via the cached
-// allowlist. It checks the capability, the model's endpoint match, and
-// duplicates first-wins. kind is used in error messages.
-func findProvider[T any](ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string, cap provider.Capability, wantEndpoint, kind string, extract func(provider.ModelLister) (T, bool)) (T, error) {
-	var zero T
-	if filter != "" {
-		p, ok := reg.Lookup(filter)
-		if !ok || !reg.Enabled(filter) || !hasCapability(p, cap) {
-			return zero, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ProviderNotFound", Message: "unknown or disabled provider " + filter}
-		}
-		if err := checkModel(ctx, p, modelID); err != nil {
-			return zero, err
-		}
-		if err := checkEndpoint(ctx, p, modelID, wantEndpoint); err != nil {
-			return zero, err
-		}
-		t, ok := extract(p)
-		if !ok {
-			return zero, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises " + kind + " but does not implement it"}
-		}
-		return t, nil
-	}
-	var result T
-	keptID := ""
-	for _, p := range reg.SortedEnabled() {
-		if !hasCapability(p, cap) {
-			continue
-		}
-		hit, err := modelAllowed(ctx, p, modelID)
-		if err != nil {
-			return zero, err
-		}
-		if !hit {
-			continue
-		}
-		if err := checkEndpoint(ctx, p, modelID, wantEndpoint); err != nil {
-			continue // wrong endpoint: skip this provider
-		}
-		candidate, ok := extract(p)
-		if !ok {
-			return zero, &provider.UpstreamError{Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider", Message: "provider advertises " + kind + " but does not implement it"}
-		}
-		if keptID != "" {
-			logger.Warn("duplicate model id, keeping first",
-				"model", modelID, "kept_provider", keptID, "skipped_provider", p.ID())
-			continue
-		}
-		result = candidate
-		keptID = p.ID()
-	}
-	if keptID == "" {
-		return zero, &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
-	}
-	return result, nil
-}
-
-// checkEndpoint rejects models whose endpoint does not match the requested
-// API (e.g. a responses-only model hit via /v1/chat/completions).
-func checkEndpoint(ctx context.Context, p provider.ModelLister, modelID, wantEndpoint string) error {
-	res, err := p.ListModels(ctx)
-	if err != nil {
-		return catalogUnavailable(err)
-	}
-	for _, m := range res.Models {
-		if m.ID == modelID {
-			if wantEndpoint != "" && m.Endpoint != "" && m.Endpoint != wantEndpoint {
-				return &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "WrongEndpoint", Message: "model " + modelID + " serves " + m.Endpoint + ", not " + wantEndpoint}
-			}
-			return nil
-		}
-	}
-	return &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "unknown or non-free model " + modelID}
-}
-
-// findChatProvider wraps findProvider for chat completions.
-func findChatProvider(ctx context.Context, reg *provider.Registry, logger *slog.Logger, modelID, filter string) (provider.ChatCompleter, error) {
-	return findProvider(ctx, reg, logger, modelID, filter,
-		provider.CapabilityChat, "chat/completions", "chat",
-		func(p provider.ModelLister) (provider.ChatCompleter, bool) {
-			cc, ok := p.(provider.ChatCompleter)
-			return cc, ok
-		})
-}
-
-// modelAllowed reports whether modelID is in the provider's cached allowlist.
-func modelAllowed(ctx context.Context, p provider.ModelLister, modelID string) (bool, error) {
-	res, err := p.ListModels(ctx)
-	if err != nil {
-		return false, catalogUnavailable(err)
-	}
-	for _, m := range res.Models {
-		if m.ID == modelID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// checkModel enforces allowlist membership for scoped routes.
-func checkModel(ctx context.Context, p provider.ModelLister, modelID string) error {
-	hit, err := modelAllowed(ctx, p, modelID)
-	if err != nil {
-		return err
-	}
-	if !hit {
-		return &provider.UpstreamError{Status: fiber.StatusNotFound, Type: "ModelNotFound", Message: "model " + modelID + " not served by provider " + p.ID()}
-	}
-	return nil
-}
-
 // catalogUnavailable maps allowlist fetch failures to 503/502.
 func catalogUnavailable(err error) error {
 	if errors.Is(err, provider.ErrNoCache) || errors.Is(err, provider.ErrUpstreamUnavailable) {
@@ -236,6 +125,95 @@ func hasCapability(p provider.ModelLister, want provider.Capability) bool {
 	return false
 }
 
+// serveChatDirect serves a chat-endpoint model straight through the chat
+// backend, relaying streams envelope-rewritten.
+func serveChatDirect(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister, filter string, req chatRequest, chatReq provider.ChatRequest) error {
+	cc, err := completerOf(p, filter, provider.CapabilityChat, "chat",
+		func(p provider.ModelLister) (provider.ChatCompleter, bool) {
+			cc, ok := p.(provider.ChatCompleter)
+			return cc, ok
+		})
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	if req.Stream {
+		return relayChatStream(c, logger, cc, chatReq, req.Model)
+	}
+	res, err := cc.Chat(c.Context(), chatReq)
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	return writeChatResponse(c, req.Model, res)
+}
+
+// serveChatFallback serves a responses-endpoint model through the chat API:
+// it calls the Responses backend (buffered non-stream) and translates the
+// result back to the chat shape.
+func serveChatFallback(c fiber.Ctx, logger *slog.Logger, p provider.ModelLister, filter string, req chatRequest, chatReq provider.ChatRequest) error {
+	rc, err := completerOf(p, filter, provider.CapabilityResponses, "responses",
+		func(p provider.ModelLister) (provider.ResponsesCompleter, bool) {
+			rc, ok := p.(provider.ResponsesCompleter)
+			return rc, ok
+		})
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	logger.Info("protocol fallback", "model", req.Model,
+		"from_endpoint", "chat/completions", "to_endpoint", "responses", "buffered", req.Stream)
+	if dropped := droppedChatFields(req); len(dropped) > 0 {
+		logger.Warn("protocol fallback dropping unsupported fields", "model", req.Model, "dropped_fields", strings.Join(dropped, ","))
+	}
+	respReq := chatToResponses(chatReq)
+	res, err := rc.Responses(c.Context(), respReq)
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, err)
+	}
+	chatRes, err := responsesPayloadToChatResult(res.Payload)
+	if err != nil {
+		return chatUpstreamError(c, logger, req.Model, &provider.UpstreamError{
+			Status: fiber.StatusBadGateway, Type: "TranslateError",
+			Message: "fallback translate failed: " + err.Error(),
+		})
+	}
+	if req.Stream {
+		setSSEHeaders(c)
+		return c.SendString(synthesizeChatSSE(chatRes.Content, chatRes.ToolCalls, req.Model, newResponseID(), time.Now().Unix()))
+	}
+	return writeChatResponse(c, req.Model, chatRes)
+}
+
+// droppedChatFields lists chat request fields with values that the Responses
+// wire cannot carry and the fallback therefore drops.
+func droppedChatFields(req chatRequest) []string {
+	var out []string
+	if req.Temperature != nil {
+		out = append(out, "temperature")
+	}
+	if req.ToolChoice != nil {
+		out = append(out, "tool_choice")
+	}
+	return out
+}
+
+// writeChatResponse renders a chat.completion JSON response.
+func writeChatResponse(c fiber.Ctx, model string, res provider.ChatResult) error {
+	reply := chatReply{Role: "assistant", Content: res.Content}
+	finish := "stop"
+	for _, tc := range res.ToolCalls {
+		var rtc replyToolCall
+		rtc.ID, rtc.Type = tc.ID, "function"
+		rtc.Function.Name, rtc.Function.Arguments = tc.Name, tc.Arguments
+		reply.ToolCalls = append(reply.ToolCalls, rtc)
+	}
+	if len(reply.ToolCalls) > 0 {
+		finish = "tool_calls"
+	}
+	return c.JSON(chatResponse{
+		ID: newResponseID(), Object: "chat.completion", Created: time.Now().Unix(),
+		Model: model, Choices: []chatChoice{{Index: 0, Message: reply, FinishReason: finish}},
+	})
+}
+
 // chatHandler serves POST /v1/chat/completions and
 // POST /:provider/v1/chat/completions (non-stream and SSE stream).
 func chatHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
@@ -247,10 +225,6 @@ func chatHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
 		if req.Model == "" || len(req.Messages) == 0 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "model and messages are required"})
 		}
-		cc, err := findChatProvider(c.Context(), reg, logger, req.Model, c.Params("provider", ""))
-		if err != nil {
-			return chatUpstreamError(c, logger, req.Model, err)
-		}
 		chatReq := provider.ChatRequest{Model: req.Model, ToolChoice: req.ToolChoice, Temperature: req.Temperature, MaxTokens: req.MaxTokens}
 		for _, m := range req.Messages {
 			chatReq.Messages = append(chatReq.Messages, provider.ChatMessage{Role: m.Role, Content: m.Content.Text})
@@ -258,28 +232,26 @@ func chatHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
 		for _, t := range req.Tools {
 			chatReq.Tools = append(chatReq.Tools, provider.ChatTool{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
 		}
-		if req.Stream {
-			return relayChatStream(c, logger, cc, chatReq, req.Model)
-		}
-		res, err := cc.Chat(c.Context(), chatReq)
+		filter := c.Params("provider", "")
+		p, m, err := resolveModel(c.Context(), reg, logger, req.Model, filter)
 		if err != nil {
 			return chatUpstreamError(c, logger, req.Model, err)
 		}
-		reply := chatReply{Role: "assistant", Content: res.Content}
-		finish := "stop"
-		for _, tc := range res.ToolCalls {
-			var rtc replyToolCall
-			rtc.ID, rtc.Type = tc.ID, "function"
-			rtc.Function.Name, rtc.Function.Arguments = tc.Name, tc.Arguments
-			reply.ToolCalls = append(reply.ToolCalls, rtc)
+		endpoint := m.Endpoint
+		if endpoint == "" {
+			endpoint = "chat/completions"
 		}
-		if len(reply.ToolCalls) > 0 {
-			finish = "tool_calls"
+		switch endpoint {
+		case "chat/completions":
+			return serveChatDirect(c, logger, p, filter, req, chatReq)
+		case "responses":
+			return serveChatFallback(c, logger, p, filter, req, chatReq)
+		default:
+			return chatUpstreamError(c, logger, req.Model, &provider.UpstreamError{
+				Status: fiber.StatusBadGateway, Type: "MisconfiguredProvider",
+				Message: "model " + req.Model + " serves unknown endpoint " + m.Endpoint,
+			})
 		}
-		return c.JSON(chatResponse{
-			ID: newResponseID(), Object: "chat.completion", Created: time.Now().Unix(),
-			Model: req.Model, Choices: []chatChoice{{Index: 0, Message: reply, FinishReason: finish}},
-		})
 	}
 }
 
@@ -294,9 +266,7 @@ func relayChatStream(c fiber.Ctx, logger *slog.Logger, cc provider.ChatCompleter
 	}
 	// raw is closed inside the stream writer: the handler returns before
 	// the stream finishes, so a defer here would kill the stream early.
-	c.Set("Content-Type", "text/event-stream")
-	c.Set("Cache-Control", "no-cache")
-	c.Set("Connection", "keep-alive")
+	setSSEHeaders(c)
 	id, created := newResponseID(), time.Now().Unix()
 	c.Response().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer raw.Close()
@@ -359,12 +329,17 @@ func cutDataLine(line string) (string, bool) {
 
 // chatUpstreamError passes the upstream status and message through verbatim,
 // keeping any hint in a separate field so the original message is intact.
+// A carried retry-after value is forwarded as a Retry-After response header
+// so downstream clients back off on the server's schedule.
 func chatUpstreamError(c fiber.Ctx, logger *slog.Logger, model string, err error) error {
 	var uerr *provider.UpstreamError
 	if errors.As(err, &uerr) {
 		body := fiber.Map{"message": uerr.Message, "type": uerr.Type, "code": uerr.Status}
 		if uerr.Hint != "" {
 			body["hint"] = uerr.Hint
+		}
+		if uerr.RetryAfter != "" {
+			c.Set("Retry-After", uerr.RetryAfter)
 		}
 		return c.Status(uerr.Status).JSON(fiber.Map{"error": body})
 	}
