@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,5 +69,63 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 		if _, err := Load(write(t, content)); err == nil {
 			t.Fatalf("expected error for %s, got nil", content)
 		}
+	}
+}
+
+// writeConfig writes a minimal valid config with the given listen value.
+func writeConfig(t *testing.T, listen string) string {
+	t.Helper()
+	path := t.TempDir() + "/config.json"
+	body := `{"listen":"` + listen + `","providers":[{"id":"x","type":"x"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// Task 1.2: QUIRKPROXY_HOST / QUIRKPROXY_PORT override the file's listen,
+// each part independently; unset parts fall back to the file.
+func TestLoadListenEnvOverride(t *testing.T) {
+	cases := []struct {
+		name             string
+		file             string
+		host, port, want string
+	}{
+		{"both set", "127.0.0.1:8080", "0.0.0.0", "9090", "0.0.0.0:9090"},
+		{"only port", "127.0.0.1:8080", "", "9090", "127.0.0.1:9090"},
+		{"only host", "127.0.0.1:8080", "0.0.0.0", "", "0.0.0.0:8080"},
+		{"neither set", "127.0.0.1:8080", "", "", "127.0.0.1:8080"},
+		{"ipv6 host preserved on port override", "[::1]:8080", "", "9090", "[::1]:9090"},
+		{"ipv6 host overridden", "[::1]:8080", "0.0.0.0", "", "0.0.0.0:8080"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("QUIRKPROXY_HOST", c.host)
+			t.Setenv("QUIRKPROXY_PORT", c.port)
+			cfg, err := Load(writeConfig(t, c.file))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Listen != c.want {
+				t.Fatalf("Listen = %q, want %q", cfg.Listen, c.want)
+			}
+		})
+	}
+}
+
+// Task 1.2: an invalid QUIRKPROXY_PORT is a fatal config error naming the var.
+func TestLoadListenEnvInvalidPort(t *testing.T) {
+	for _, bad := range []string{"abc", "0", "70000", "-1", "8080x"} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv("QUIRKPROXY_HOST", "")
+			t.Setenv("QUIRKPROXY_PORT", bad)
+			_, err := Load(writeConfig(t, "127.0.0.1:8080"))
+			if err == nil {
+				t.Fatalf("expected error for port %q, got nil", bad)
+			}
+			if !strings.Contains(err.Error(), "QUIRKPROXY_PORT") {
+				t.Fatalf("error = %v, want it to name QUIRKPROXY_PORT", err)
+			}
+		})
 	}
 }

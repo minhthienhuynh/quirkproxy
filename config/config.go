@@ -3,8 +3,19 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"time"
+)
+
+// Environment overrides for the bind address. When set (non-empty), they take
+// precedence over the file's `listen`; whichever part is unset falls back to
+// `listen`. Names carry the QUIRKPROXY_ prefix to avoid clashing with generic
+// platform variables like PORT.
+const (
+	envHost = "QUIRKPROXY_HOST"
+	envPort = "QUIRKPROXY_PORT"
 )
 
 // Duration is a time.Duration that unmarshals from strings like "1h30m".
@@ -72,6 +83,9 @@ func Load(path string) (Config, error) {
 	if cfg.Listen == "" {
 		return Config{}, fmt.Errorf("config: listen must not be empty")
 	}
+	if err := applyListenEnv(&cfg); err != nil {
+		return Config{}, err
+	}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
 		if p.ID == "" {
@@ -93,4 +107,33 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// applyListenEnv overrides the bind host and/or port from QUIRKPROXY_HOST and
+// QUIRKPROXY_PORT. Each var only overrides its own part (when non-empty); the
+// remainder comes from the file's `listen`. An invalid port is a fatal config
+// error rather than a silent fallback.
+func applyListenEnv(cfg *Config) error {
+	hostEnv := os.Getenv(envHost)
+	portEnv := os.Getenv(envPort)
+	if hostEnv == "" && portEnv == "" {
+		// No override: leave the file value exactly as-is.
+		return nil
+	}
+	host, port, err := net.SplitHostPort(cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("config: invalid listen %q: %w", cfg.Listen, err)
+	}
+	if hostEnv != "" {
+		host = hostEnv
+	}
+	if portEnv != "" {
+		n, err := strconv.Atoi(portEnv)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("config: %s %q is not a valid port", envPort, portEnv)
+		}
+		port = portEnv
+	}
+	cfg.Listen = net.JoinHostPort(host, port)
+	return nil
 }

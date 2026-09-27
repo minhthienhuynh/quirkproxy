@@ -43,6 +43,10 @@ See `config.sample.json`. Each provider shares one envelope:
   (default `30s`, wait for upstream headers). Inference is never cut off by a
   fixed total request timeout.
 
+Bind address can be overridden at runtime without editing the file (env wins
+over `listen`): `QUIRKPROXY_HOST` and `QUIRKPROXY_PORT`. Set only one to keep the
+other from `listen`.
+
 ## API
 
 `GET /v1/models` returns the OpenAI core shape (`id`, `object`,
@@ -94,4 +98,6 @@ one registration line. No reflection, no plugins.
 ## Deployment
 
 Push `main` to trigger CI (gates → GHCR image → Dokploy deploy).
-See `docs/deploy.md` for prerequisites and security notes.
+Bind address can be overridden at runtime via `QUIRKPROXY_HOST` /
+`QUIRKPROXY_PORT` (see `.env.example`); keep the proxy behind a reverse
+proxy with TLS — it has no auth of its own.
