@@ -1,0 +1,28 @@
+# Reference copy of the deployed compose.
+#
+# Dokploy's database copy (`compose.composeFile`) is the source of truth and is
+# what actually gets rendered to the host, so editing this file alone does NOT
+# change the running service. Update it here for review, then apply the same
+# edit in Dokploy (UI editor or `compose.update`) and redeploy.
+#
+# .env equivalents: QUIRKPROXY_HOST, QUIRKPROXY_PORT, QUIRK_HOST_PORT.
+services:
+  quirk:
+    image: ghcr.io/minhthienhuynh/quirkproxy:latest
+    restart: unless-stopped
+    # Always re-resolve `:latest` — without this a redeploy can reuse the cached
+    # local tag and silently keep running the previous build.
+    pull_policy: always
+    environment:
+      - QUIRKPROXY_HOST=${QUIRKPROXY_HOST:-0.0.0.0}
+      - QUIRKPROXY_PORT=${QUIRKPROXY_PORT:-8080}
+    ports:
+      # Loopback only: the proxy has no auth of its own. Swarm applications
+      # cannot express this (EndpointSpec binds 0.0.0.0), which is why this
+      # service is a compose project rather than an application.
+      - "127.0.0.1:${QUIRK_HOST_PORT:-18080}:${QUIRKPROXY_PORT:-8080}"
+    networks:
+      - dokploy-network
+networks:
+  dokploy-network:
+    external: true

@@ -97,7 +97,18 @@ one registration line. No reflection, no plugins.
 
 ## Deployment
 
-Push `main` to trigger CI (gates → GHCR image → Dokploy deploy).
-Bind address can be overridden at runtime via `QUIRKPROXY_HOST` /
-`QUIRKPROXY_PORT` (see `.env.example`); keep the proxy behind a reverse
-proxy with TLS — it has no auth of its own.
+Push `main` to trigger CI (gates → GHCR image → Dokploy redeploy).
+The Dokploy service is a **compose project** (`sourceType: raw`), so the CI's
+last job calls `POST {DOKPLOY_URL}/api/compose.redeploy` with
+`{"composeId": "$DOKPLOY_COMPOSE_ID"}`.
+
+Required repo secrets (Settings → Secrets → Actions):
+
+- `DOKPLOY_URL` — panel base URL, no `/api` suffix
+- `DOKPLOY_API_KEY` — Dokploy API key
+- `DOKPLOY_COMPOSE_ID` — compose id (replaces the old `DOKPLOY_APP_ID`)
+
+The compose sets `QUIRKPROXY_HOST` / `QUIRKPROXY_PORT` from its `.env` and
+publishes only to loopback (`127.0.0.1:${QUIRK_HOST_PORT:-18080}`), so the
+unauthenticated proxy is never exposed to the public interface. Keep it behind
+a reverse proxy with TLS.

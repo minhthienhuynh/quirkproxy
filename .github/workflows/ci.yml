@@ -75,26 +75,26 @@ jobs:
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
-          DOKPLOY_APP_ID: ${{ secrets.DOKPLOY_APP_ID }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
         run: |
           : "${DOKPLOY_URL:?missing DOKPLOY_URL secret}"
           : "${DOKPLOY_API_KEY:?missing DOKPLOY_API_KEY secret}"
-          : "${DOKPLOY_APP_ID:?missing DOKPLOY_APP_ID secret}"
+          : "${DOKPLOY_COMPOSE_ID:?missing DOKPLOY_COMPOSE_ID secret}"
           base="${DOKPLOY_URL%/}"
-          payload="{\"applicationId\":\"$DOKPLOY_APP_ID\"}"
+          payload="{\"composeId\":\"$DOKPLOY_COMPOSE_ID\"}"
           body_file=$(mktemp)
           code=$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' -X POST \
             -H "x-api-key: $DOKPLOY_API_KEY" \
             -H 'Content-Type: application/json' \
-            "$base/api/application.redeploy" \
+            "$base/api/compose.redeploy" \
             -d "$payload") || true
-          echo "application.redeploy -> HTTP $code"
+          echo "compose.redeploy -> HTTP $code"
           cat "$body_file"; echo
           rm -f "$body_file"
           case "$code" in
             2*) echo 'Dokploy redeploy triggered' ;;
-            401|403) echo 'ERROR: Unauthorized/Forbidden — check DOKPLOY_API_KEY secret and its access to the app'; exit 1 ;;
-            404) echo 'ERROR: Not found — check DOKPLOY_URL (panel base URL, no /api suffix) and DOKPLOY_APP_ID secret'; exit 1 ;;
+            401|403) echo 'ERROR: Unauthorized/Forbidden — check DOKPLOY_API_KEY secret and its access to the compose'; exit 1 ;;
+            404) echo 'ERROR: Not found — check DOKPLOY_URL (panel base URL, no /api suffix) and DOKPLOY_COMPOSE_ID secret'; exit 1 ;;
             000) echo 'ERROR: Could not reach Dokploy — check DOKPLOY_URL is a public URL (not localhost/LAN)'; exit 1 ;;
             *) echo 'ERROR: Trigger failed'; exit 1 ;;
           esac
