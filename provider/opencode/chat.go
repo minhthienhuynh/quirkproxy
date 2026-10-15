@@ -20,7 +20,7 @@ import (
 // Pinned genuine client recipe (verified live; see design spike findings).
 // The UA triple must track the release the gate currently accepts.
 const (
-	defaultUserAgent = "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2"
+	defaultUserAgent = "opencode/latest/2.0.27/cli"
 	defaultClient    = "cli"
 	defaultProject   = "global"
 	defaultAPIKey    = "public"
@@ -134,15 +134,19 @@ func skeletalTool(name string) wireTool {
 	return t
 }
 
-// ensureGateTools appends skeletal bash/read entries when absent.
+// ensureGateTools appends skeletal quartet entries when absent.
 func ensureGateTools(tools []wireTool) []wireTool {
-	var bash, read bool
+	var bash, read, glob, grep bool
 	for _, t := range tools {
 		switch t.Function.Name {
 		case "bash":
 			bash = true
 		case "read":
 			read = true
+		case "glob":
+			glob = true
+		case "grep":
+			grep = true
 		}
 	}
 	if !bash {
@@ -150,6 +154,12 @@ func ensureGateTools(tools []wireTool) []wireTool {
 	}
 	if !read {
 		tools = append(tools, skeletalTool("read"))
+	}
+	if !glob {
+		tools = append(tools, skeletalTool("glob"))
+	}
+	if !grep {
+		tools = append(tools, skeletalTool("grep"))
 	}
 	return tools
 }
@@ -276,6 +286,9 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 	}
 	httpReq.Header.Set("x-opencode-request", reqID)
 	httpReq.Header.Set("x-opencode-session", sesID)
+	httpReq.Header.Set("x-opencode-session-id", sesID)
+	httpReq.Header.Set("x-session-affinity", sesID)
+	httpReq.Header.Set("x-session-id", sesID)
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {

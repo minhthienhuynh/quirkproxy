@@ -38,15 +38,19 @@ func skeletalRespTool(name string) respWireTool {
 	}
 }
 
-// ensureRespGateTools appends skeletal bash/read entries when absent.
+// ensureRespGateTools appends skeletal quartet entries when absent.
 func ensureRespGateTools(tools []respWireTool) []respWireTool {
-	var bash, read bool
+	var bash, read, glob, grep bool
 	for _, t := range tools {
 		switch t.Name {
 		case "bash":
 			bash = true
 		case "read":
 			read = true
+		case "glob":
+			glob = true
+		case "grep":
+			grep = true
 		}
 	}
 	if !bash {
@@ -54,6 +58,12 @@ func ensureRespGateTools(tools []respWireTool) []respWireTool {
 	}
 	if !read {
 		tools = append(tools, skeletalRespTool("read"))
+	}
+	if !glob {
+		tools = append(tools, skeletalRespTool("glob"))
+	}
+	if !grep {
+		tools = append(tools, skeletalRespTool("grep"))
 	}
 	return tools
 }

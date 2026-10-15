@@ -17,7 +17,7 @@
         "zen_models_url": "https://opencode.ai/zen/v1/models",
         "models_dev_url": "https://models.dev/api.json",
         "zen_api_url": "https://opencode.ai/zen/v1",
-        "user_agent": "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2",
+        "user_agent": "opencode/latest/2.0.27/cli",
         "client": "cli",
         "project": "global"
       }

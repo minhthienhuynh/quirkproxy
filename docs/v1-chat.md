@@ -16,13 +16,13 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
 
 ## Recipe (pinned genuine markers, verified live)
 
-- `User-Agent`: `opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2`
+- `User-Agent`: `opencode/latest/2.0.27/cli`
   (override via options `user_agent`; a stale pin fails closed with 403)
-- Headers: `Authorization: Bearer <key>` (`zen_api_key` option, default
+- Headers: `Authorization: Bearer *** (`zen_api_key` option, default
   `public`), `x-opencode-client: cli`, `x-opencode-project: global`,
   fresh `x-opencode-request` (`msg_` + 12hex + 14base62) and
-  `x-opencode-session` (`ses_` + same format) per call
-- Body: `stream:true` forced; `tools` must contain `bash` and `read`
+  `x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`, `x-session-id` (`ses_` + same format) per call
+- Body: `stream:true` forced; `tools` must contain `bash`, `read`, `glob`, `grep`
   (client tools pass through; skeletal entries appended when absent;
   schemas beyond names are irrelevant to the gate)
 

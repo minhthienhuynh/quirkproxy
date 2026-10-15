@@ -78,8 +78,8 @@ func TestResponsesRecipeHeaders(t *testing.T) {
 		}
 		return false
 	}
-	if !has("bash") || !has("read") {
-		t.Fatalf("tools = %v, want bash+read ensured", names)
+	if !has("bash") || !has("read") || !has("glob") || !has("grep") {
+		t.Fatalf("tools = %v, want bash+read+glob+grep ensured", names)
 	}
 }
 
