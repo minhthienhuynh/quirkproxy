@@ -60,8 +60,11 @@ func TestChatRecipeHeaders(t *testing.T) {
 	if gotClient != "cli" || gotProject != "global" {
 		t.Fatalf("client/project = %q/%q", gotClient, gotProject)
 	}
-	if !msgPat.MatchString(gotReq) || !sesPat.MatchString(gotSes) {
-		t.Fatalf("id formats: req=%q ses=%q", gotReq, gotSes)
+	if gotReq != "" {
+		t.Fatalf("x-opencode-request = %q, want omitted in v2", gotReq)
+	}
+	if !sesPat.MatchString(gotSes) {
+		t.Fatalf("id formats: ses=%q", gotSes)
 	}
 	if gotSesID != gotSes || gotAffinity != gotSes || gotSesIDHeader != gotSes {
 		t.Fatalf("session headers mismatch: ses=%q sesID=%q affinity=%q sesIDHeader=%q", gotSes, gotSesID, gotAffinity, gotSesIDHeader)
@@ -84,8 +87,12 @@ func TestChatRecipeHeaders(t *testing.T) {
 		}
 		return false
 	}
-	if !has("bash") || !has("read") || !has("glob") || !has("grep") {
-		t.Fatalf("tools = %v, want bash+read+glob+grep ensured", names)
+	if !has("shell") || !has("read") || !has("glob") || !has("grep") {
+		t.Fatalf("tools = %v, want shell+read+glob+grep ensured", names)
+	}
+	msgs := gotBody["messages"].([]any)
+	if len(msgs) < 2 || msgs[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("messages = %v, want system prompt prepended", msgs)
 	}
 }
 

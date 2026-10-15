@@ -53,8 +53,11 @@ func TestResponsesRecipeHeaders(t *testing.T) {
 	if gotClient != "cli" || gotProject != "global" {
 		t.Fatalf("client/project = %q/%q", gotClient, gotProject)
 	}
-	if !msgPat.MatchString(gotReq) || !sesPat.MatchString(gotSes) {
-		t.Fatalf("id formats: req=%q ses=%q", gotReq, gotSes)
+	if gotReq != "" {
+		t.Fatalf("x-opencode-request = %q, want omitted in v2", gotReq)
+	}
+	if !sesPat.MatchString(gotSes) {
+		t.Fatalf("id formats: ses=%q", gotSes)
 	}
 	if gotAuth != "Bearer test-key" || gotCT != "application/json" {
 		t.Fatalf("auth/ct = %q/%q", gotAuth, gotCT)
@@ -78,8 +81,8 @@ func TestResponsesRecipeHeaders(t *testing.T) {
 		}
 		return false
 	}
-	if !has("bash") || !has("read") || !has("glob") || !has("grep") {
-		t.Fatalf("tools = %v, want bash+read+glob+grep ensured", names)
+	if !has("shell") || !has("read") || !has("glob") || !has("grep") {
+		t.Fatalf("tools = %v, want shell+read+glob+grep ensured", names)
 	}
 }
 

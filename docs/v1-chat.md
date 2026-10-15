@@ -22,9 +22,9 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
   `public`), `x-opencode-client: cli`, `x-opencode-project: global`,
   fresh `x-opencode-request` (`msg_` + 12hex + 14base62) and
   `x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`, `x-session-id` (`ses_` + same format) per call
-- Body: `stream:true` forced; `tools` must contain `bash`, `read`, `glob`, `grep`
-  (client tools pass through; skeletal entries appended when absent;
-  schemas beyond names are irrelevant to the gate)
+- Body: `stream:true` forced; `tools` must contain `shell`, `read`, `glob`, `grep`
+  (client tools pass through; genuine entries appended when absent);
+  system prompt automatically ensures OpenCode agent harness prefix
 
 ## Request/response map
 

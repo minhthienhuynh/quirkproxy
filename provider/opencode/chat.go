@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minhthienhuynh/quirkproxy/provider"
@@ -51,29 +53,37 @@ const (
 	b62Chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
-// newRequestID generates msg_<12hex><14base62>; newSessionID ses_....
-func newRequestID() (string, error) {
-	hex, err := randStr(hexChars, 12)
-	if err != nil {
-		return "", err
-	}
-	b62, err := randStr(b62Chars, 14)
-	if err != nil {
-		return "", err
-	}
-	return "msg_" + hex + b62, nil
-}
+var (
+	idCounter uint32
+	idMu      sync.Mutex
+)
 
+// newSessionID generates ses_<12hex><14base62> using OpenCode v2's descending timestamp format.
 func newSessionID() (string, error) {
-	hex, err := randStr(hexChars, 12)
-	if err != nil {
-		return "", err
+	idMu.Lock()
+	now := time.Now().UnixMilli()
+	idCounter++
+	cnt := idCounter
+	idMu.Unlock()
+
+	current := uint64(now)*4096 + uint64(cnt%4096)
+	val := ^current
+
+	timeBytes := make([]byte, 6)
+	for i := 0; i < 6; i++ {
+		timeBytes[i] = byte((val >> (40 - 8*uint(i))) & 0xff)
 	}
-	b62, err := randStr(b62Chars, 14)
-	if err != nil {
-		return "", err
+	timeHex := hex.EncodeToString(timeBytes)
+
+	b62 := make([]byte, 14)
+	randBytes := make([]byte, 14)
+	if _, err := rand.Read(randBytes); err != nil {
+		return "", fmt.Errorf("crypto rand: %w", err)
 	}
-	return "ses_" + hex + b62, nil
+	for i, b := range randBytes {
+		b62[i] = b62Chars[int(b)%len(b62Chars)]
+	}
+	return "ses_" + timeHex + string(b62), nil
 }
 
 func randStr(chars string, n int) (string, error) {
@@ -134,32 +144,16 @@ func skeletalTool(name string) wireTool {
 	return t
 }
 
-// ensureGateTools appends skeletal quartet entries when absent.
+// ensureGateTools appends genuine v2 tool entries when absent.
 func ensureGateTools(tools []wireTool) []wireTool {
-	var bash, read, glob, grep bool
+	existing := make(map[string]bool, len(tools))
 	for _, t := range tools {
-		switch t.Function.Name {
-		case "bash":
-			bash = true
-		case "read":
-			read = true
-		case "glob":
-			glob = true
-		case "grep":
-			grep = true
+		existing[t.Function.Name] = true
+	}
+	for _, reqTool := range v2GateWireTools() {
+		if !existing[reqTool.Function.Name] {
+			tools = append(tools, reqTool)
 		}
-	}
-	if !bash {
-		tools = append(tools, skeletalTool("bash"))
-	}
-	if !read {
-		tools = append(tools, skeletalTool("read"))
-	}
-	if !glob {
-		tools = append(tools, skeletalTool("glob"))
-	}
-	if !grep {
-		tools = append(tools, skeletalTool("grep"))
 	}
 	return tools
 }
@@ -235,9 +229,31 @@ func aggregateSSE(r io.Reader) (string, []provider.ToolCall, int, error) {
 
 // buildBody maps a normalized request to the Zen wire shape.
 func buildBody(req provider.ChatRequest, model string) chatBody {
-	msgs := make([]wireMessage, 0, len(req.Messages))
+	var hasSystem bool
 	for _, m := range req.Messages {
-		msgs = append(msgs, wireMessage{Role: m.Role, Content: m.Content})
+		if m.Role == "system" {
+			hasSystem = true
+			break
+		}
+	}
+
+	msgs := make([]wireMessage, 0, len(req.Messages)+1)
+	if !hasSystem {
+		msgs = append(msgs, wireMessage{Role: "system", Content: defaultHarnessPrompt})
+	}
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			if !strings.Contains(m.Content, "OpenCode") {
+				msgs = append(msgs, wireMessage{
+					Role:    "system",
+					Content: defaultHarnessPrompt + "\n\n# User Instructions\n" + m.Content,
+				})
+			} else {
+				msgs = append(msgs, wireMessage{Role: m.Role, Content: m.Content})
+			}
+		} else {
+			msgs = append(msgs, wireMessage{Role: m.Role, Content: m.Content})
+		}
 	}
 	tools := make([]wireTool, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -274,17 +290,11 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("x-opencode-client", c.recipe.Client)
 	httpReq.Header.Set("x-opencode-project", c.recipe.Project)
-	reqID, err := newRequestID()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
 	sesID, err := newSessionID()
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	httpReq.Header.Set("x-opencode-request", reqID)
 	httpReq.Header.Set("x-opencode-session", sesID)
 	httpReq.Header.Set("x-opencode-session-id", sesID)
 	httpReq.Header.Set("x-session-affinity", sesID)

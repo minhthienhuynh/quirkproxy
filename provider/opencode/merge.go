@@ -73,7 +73,7 @@ func New(cfg config.Provider, logger *slog.Logger) *Provider {
 		logger:     logger,
 		genTimeout: durationOption(cfg.Options, "inference_generation_timeout", defaultInferenceGenerationTimeout),
 		recipe: recipeFromOptions(cfg.Options,
-			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/zen/v1")),
+			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/inference/v1")),
 	}
 	return p
 }
