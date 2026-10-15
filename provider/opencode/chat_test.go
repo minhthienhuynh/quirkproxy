@@ -25,10 +25,14 @@ var (
 
 func TestChatRecipeHeaders(t *testing.T) {
 	var gotUA, gotClient, gotProject, gotReq, gotSes, gotAuth, gotCT string
+	var gotSesID, gotAffinity, gotSesIDHeader string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUA, gotClient, gotProject = r.Header.Get("User-Agent"), r.Header.Get("x-opencode-client"), r.Header.Get("x-opencode-project")
 		gotReq, gotSes = r.Header.Get("x-opencode-request"), r.Header.Get("x-opencode-session")
+		gotSesID = r.Header.Get("x-opencode-session-id")
+		gotAffinity = r.Header.Get("x-session-affinity")
+		gotSesIDHeader = r.Header.Get("x-session-id")
 		gotAuth, gotCT = r.Header.Get("Authorization"), r.Header.Get("Content-Type")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode body: %v", err)
@@ -56,8 +60,14 @@ func TestChatRecipeHeaders(t *testing.T) {
 	if gotClient != "cli" || gotProject != "global" {
 		t.Fatalf("client/project = %q/%q", gotClient, gotProject)
 	}
-	if !msgPat.MatchString(gotReq) || !sesPat.MatchString(gotSes) {
-		t.Fatalf("id formats: req=%q ses=%q", gotReq, gotSes)
+	if gotReq != "" {
+		t.Fatalf("x-opencode-request = %q, want omitted in v2", gotReq)
+	}
+	if !sesPat.MatchString(gotSes) {
+		t.Fatalf("id formats: ses=%q", gotSes)
+	}
+	if gotSesID != gotSes || gotAffinity != gotSes || gotSesIDHeader != gotSes {
+		t.Fatalf("session headers mismatch: ses=%q sesID=%q affinity=%q sesIDHeader=%q", gotSes, gotSesID, gotAffinity, gotSesIDHeader)
 	}
 	if gotAuth != "Bearer test-key" || gotCT != "application/json" {
 		t.Fatalf("auth/ct = %q/%q", gotAuth, gotCT)
@@ -77,8 +87,12 @@ func TestChatRecipeHeaders(t *testing.T) {
 		}
 		return false
 	}
-	if !has("bash") || !has("read") {
-		t.Fatalf("tools = %v, want bash+read ensured", names)
+	if !has("shell") || !has("read") || !has("glob") || !has("grep") {
+		t.Fatalf("tools = %v, want shell+read+glob+grep ensured", names)
+	}
+	msgs := gotBody["messages"].([]any)
+	if len(msgs) < 2 || msgs[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("messages = %v, want system prompt prepended", msgs)
 	}
 }
 

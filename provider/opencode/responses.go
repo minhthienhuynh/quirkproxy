@@ -38,22 +38,16 @@ func skeletalRespTool(name string) respWireTool {
 	}
 }
 
-// ensureRespGateTools appends skeletal bash/read entries when absent.
+// ensureRespGateTools appends genuine v2 tool entries when absent.
 func ensureRespGateTools(tools []respWireTool) []respWireTool {
-	var bash, read bool
+	existing := make(map[string]bool, len(tools))
 	for _, t := range tools {
-		switch t.Name {
-		case "bash":
-			bash = true
-		case "read":
-			read = true
+		existing[t.Name] = true
+	}
+	for _, reqTool := range v2GateRespTools() {
+		if !existing[reqTool.Name] {
+			tools = append(tools, reqTool)
 		}
-	}
-	if !bash {
-		tools = append(tools, skeletalRespTool("bash"))
-	}
-	if !read {
-		tools = append(tools, skeletalRespTool("read"))
 	}
 	return tools
 }

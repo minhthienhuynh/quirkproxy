@@ -31,7 +31,7 @@ One recipe covers both endpoints; a change to the recipe applies to both.
 |---|---|
 | `model` | must be in the free allowlist, else 404 before upstream |
 | `input` | string or items array, passed through verbatim on the direct path; via fallback a string becomes one user message, an array maps message/input_text items keeping role |
-| `tools[]` | Responses function shape (`{type:"function",name,description,parameters}`) verbatim + gate entries (`bash`, `read`) ensured (mapped 1-1 through fallback) |
+| `tools[]` | Responses function shape (`{type:"function",name,description,parameters}`) verbatim + gate entries (`shell`, `read`, `glob`, `grep`) ensured (mapped 1-1 through fallback) |
 | `reasoning` | verbatim when present on the direct path; dropped on the fallback path (chat wire has no equivalent) |
 | `max_output_tokens` | verbatim when present on the direct path; maps to `max_tokens` on the fallback path |
 | `stream:true` | SSE relay: `event:` lines preserved, envelope rewritten in `response` objects, output items byte-identical, single proxy-emitted `response.completed` |
