@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 // Pinned genuine client recipe (verified live; see design spike findings).
 // The UA triple must track the release the gate currently accepts.
 const (
-	defaultUserAgent = "opencode/latest/2.0.27/cli"
+	defaultUserAgent = "opencode/latest/2.0.32/cli"
 	defaultClient    = "cli"
 	defaultProject   = "global"
 	defaultAPIKey    = "public"
@@ -39,12 +40,22 @@ type Recipe struct {
 
 // recipeFromOptions builds the recipe from provider options with verified defaults.
 func recipeFromOptions(opts map[string]any, baseURL string) Recipe {
+	apiKey := stringOption(opts, "zen_api_key", "")
+	if apiKey == "" {
+		if envKey := os.Getenv("OPENCODE_API_KEY"); envKey != "" {
+			apiKey = envKey
+		} else if envKey := os.Getenv("ZEN_API_KEY"); envKey != "" {
+			apiKey = envKey
+		} else {
+			apiKey = defaultAPIKey
+		}
+	}
 	return Recipe{
 		UserAgent: stringOption(opts, "user_agent", defaultUserAgent),
 		Client:    stringOption(opts, "client", defaultClient),
 		Project:   stringOption(opts, "project", defaultProject),
-		APIKey:    stringOption(opts, "zen_api_key", defaultAPIKey),
-		BaseURL:   baseURL,
+		APIKey:    apiKey,
+		BaseURL:   strings.TrimRight(baseURL, "/"),
 	}
 }
 
@@ -299,7 +310,9 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 		cancel()
 		return nil, fmt.Errorf("%s request: %w", kind, err)
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.recipe.APIKey)
+	if c.recipe.APIKey != "" && c.recipe.APIKey != "public" && c.recipe.APIKey != "none" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.recipe.APIKey)
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", c.recipe.UserAgent)
 	httpReq.Header.Set("Accept", "text/event-stream")

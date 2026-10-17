@@ -247,3 +247,46 @@ func TestUpstreamErrorCapturesRetryAfter(t *testing.T) {
 		})
 	}
 }
+
+func TestChatRecipeKeylessAndAuthHeader(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	// Default (public/keyless): Authorization header must be omitted
+	c1 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+	_, err := c1.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
+	if err != nil {
+		t.Fatalf("chat default: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("keyless default Authorization = %q, want omitted", gotAuth)
+	}
+
+	// Explicit key: Authorization header must be sent
+	c2 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(map[string]any{
+		"zen_api_key": "st_token_123",
+	}, srv.URL)}
+	_, err = c2.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
+	if err != nil {
+		t.Fatalf("chat with key: %v", err)
+	}
+	if gotAuth != "Bearer st_token_123" {
+		t.Fatalf("Authorization with key = %q, want Bearer st_token_123", gotAuth)
+	}
+
+	// Environment variable fallback
+	t.Setenv("OPENCODE_API_KEY", "env_token_456")
+	c3 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+	_, err = c3.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
+	if err != nil {
+		t.Fatalf("chat with env key: %v", err)
+	}
+	if gotAuth != "Bearer env_token_456" {
+		t.Fatalf("Authorization with env key = %q, want Bearer env_token_456", gotAuth)
+	}
+}

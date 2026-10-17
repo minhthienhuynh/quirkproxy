@@ -37,10 +37,10 @@ Multi-tier: `context_over_200k.input > 0` also counts as paid (matches CLI `cost
 
 ## opencode CLI reference
 
-Pinned version: **opencode v2.0.27** (source: `anomalyco/opencode`).
+Pinned version: **opencode v2.0.32** (source: `anomalyco/opencode`).
 
 Version-dependent constants in code:
-- `defaultUserAgent` in `provider/opencode/chat.go:22` — `"opencode/latest/2.0.27/cli"`
+- `defaultUserAgent` in `provider/opencode/chat.go:22` — `"opencode/latest/2.0.32/cli"`
 - `x-opencode-*` and session affinity headers generated per-request in `provider/opencode/chat.go` (`postToPath`)
 
 Key CLI source files (path in sst/opencode repo):

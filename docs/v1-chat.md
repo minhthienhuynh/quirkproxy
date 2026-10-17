@@ -16,12 +16,12 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
 
 ## Recipe (pinned genuine markers, verified live)
 
-- `User-Agent`: `opencode/latest/2.0.27/cli`
+- `User-Agent`: `opencode/latest/2.0.32/cli`
   (override via options `user_agent`; a stale pin fails closed with 403)
-- Headers: `Authorization: Bearer *** (`zen_api_key` option, default
-  `public`), `x-opencode-client: cli`, `x-opencode-project: global`,
-  fresh `x-opencode-request` (`msg_` + 12hex + 14base62) and
-  `x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`, `x-session-id` (`ses_` + same format) per call
+- Headers: `Authorization: Bearer <key>` when `zen_api_key` or `OPENCODE_API_KEY`/`ZEN_API_KEY`
+  is configured; omitted in keyless mode (default `public`/empty). `x-opencode-client: cli`,
+  `x-opencode-project: global`, session affinity headers `x-opencode-session`, `x-opencode-session-id`,
+  `x-session-affinity`, `x-session-id` (`ses_` + 12hex + 14base62) per call.
 - Body: `stream:true` forced; `tools` must contain `shell`, `read`, `glob`, `grep`
   (client tools pass through; genuine entries appended when absent);
   system prompt automatically ensures OpenCode agent harness prefix

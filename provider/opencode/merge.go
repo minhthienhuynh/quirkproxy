@@ -73,7 +73,7 @@ func New(cfg config.Provider, logger *slog.Logger) *Provider {
 		logger:     logger,
 		genTimeout: durationOption(cfg.Options, "inference_generation_timeout", defaultInferenceGenerationTimeout),
 		recipe: recipeFromOptions(cfg.Options,
-			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/inference/v1")),
+			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/inference/openai/v1")),
 		sessions: newSessionManager(
 			durationOption(cfg.Options, "session_ttl", defaultSessionTTL),
 			intOption(cfg.Options, "session_max_size", defaultMaxSessions),
