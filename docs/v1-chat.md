@@ -22,6 +22,10 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
   is configured; omitted in keyless mode (default `public`/empty). `x-opencode-client: cli`,
   `x-opencode-project: global`, session affinity headers `x-opencode-session`, `x-opencode-session-id`,
   `x-session-affinity`, `x-session-id` (`ses_` + 12hex + 14base62) per call.
+- Session id: `ses_` + 12hex + 14base62; the 12 hex pack `~(ms*4096 + counter)` and the
+  gate accepts only `counter < 64`. The proxy mirrors the genuine client: it counts mints
+  within one millisecond and resets when the ms changes, so every session minted over a
+  process lifetime stays inside the bound (no uptime cliff).
 - Body: `stream:true` forced; `tools` must contain `shell`, `read`, `glob`, `grep`
   (client tools pass through; genuine entries appended when absent);
   system prompt automatically ensures OpenCode agent harness prefix
@@ -93,6 +97,7 @@ empty, or non-positive):
 ## Test cross-reference
 
 - Recipe headers/body/IDs: `provider/opencode/chat_test.go` → `TestChatRecipeHeaders`
+- Session id counter semantics + gate bound regression: `provider/opencode/session_test.go` → `TestNewSessionIDCounterResetsPerMillisecond`, `TestNewSessionIDCounterStaysWithinGateBound`
 - SSE aggregation + tool-call merge: `TestChatSSEAggregation`
 - 403+hint passthrough, single upstream hit: `TestChatUpstreamErrors`
 - Key redaction: `TestRecipeDefaultsAndNoKeyLeak`
