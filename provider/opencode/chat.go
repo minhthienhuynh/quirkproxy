@@ -107,6 +107,21 @@ type zenChatClient struct {
 	// safety net; the body lifetime is otherwise bounded by the caller's
 	// context (client disconnect). Zero means no bound (tests only).
 	genTimeout time.Duration
+	sessions   *SessionManager
+}
+
+func (c *zenChatClient) resolveSession(hint, identity string) string {
+	if c.sessions != nil {
+		return c.sessions.Resolve(hint, identity)
+	}
+	if hint != "" {
+		return translateSessionID(hint)
+	}
+	sesID, err := newSessionID()
+	if err != nil {
+		return translateSessionID(identity)
+	}
+	return sesID
 }
 
 // chatBody is the Zen wire shape (OpenAI-compatible subset).
@@ -277,7 +292,7 @@ func buildBody(req provider.ChatRequest, model string) chatBody {
 // and returns the raw SSE stream on 200. Shared by chat and responses.
 // The call is bounded by genTimeout (headers + body) as a safety net on top
 // of the caller's context; the bound is cancelled when the body is closed.
-func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []byte, kind string) (io.ReadCloser, error) {
+func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []byte, kind string, hints ...string) (io.ReadCloser, error) {
 	ctx, cancel := c.boundContext(ctx)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.recipe.BaseURL+path, bytes.NewReader(payload))
 	if err != nil {
@@ -290,11 +305,15 @@ func (c *zenChatClient) postToPath(ctx context.Context, path string, payload []b
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("x-opencode-client", c.recipe.Client)
 	httpReq.Header.Set("x-opencode-project", c.recipe.Project)
-	sesID, err := newSessionID()
-	if err != nil {
-		cancel()
-		return nil, err
+
+	var hint, identity string
+	if len(hints) > 0 {
+		hint = hints[0]
 	}
+	if len(hints) > 1 {
+		identity = hints[1]
+	}
+	sesID := c.resolveSession(hint, identity)
 	httpReq.Header.Set("x-opencode-session", sesID)
 	httpReq.Header.Set("x-opencode-session-id", sesID)
 	httpReq.Header.Set("x-session-affinity", sesID)
@@ -340,18 +359,18 @@ func (r *cancelReadCloser) Close() error {
 	return err
 }
 
-func (c *zenChatClient) postRaw(ctx context.Context, body chatBody) (io.ReadCloser, error) {
+func (c *zenChatClient) postRaw(ctx context.Context, body chatBody, hints ...string) (io.ReadCloser, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("encode chat: %w", err)
 	}
-	return c.postToPath(ctx, "/chat/completions", payload, "chat")
+	return c.postToPath(ctx, "/chat/completions", payload, "chat", hints...)
 }
 
 // chat posts one request with stream forced on (gate requirement) and
 // returns the aggregated result.
 func (c *zenChatClient) chat(ctx context.Context, req provider.ChatRequest, model string) (provider.ChatResult, error) {
-	body, err := c.postRaw(ctx, buildBody(req, model))
+	body, err := c.postRaw(ctx, buildBody(req, model), req.SessionID, req.ClientIdentity)
 	if err != nil {
 		return provider.ChatResult{}, err
 	}

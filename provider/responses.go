@@ -13,6 +13,8 @@ type ResponsesRequest struct {
 	Tools           []ResponsesTool
 	Reasoning       any
 	MaxOutputTokens *int
+	SessionID       string
+	ClientIdentity  string
 }
 
 // ResponsesTool is one function tool in provider-neutral form.

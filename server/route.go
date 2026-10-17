@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -103,4 +106,24 @@ func setSSEHeaders(c fiber.Ctx) {
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
 	c.Set("Connection", "keep-alive")
+}
+
+// extractSessionHint returns the first non-empty session identifier from headers
+// or the OpenAI user field.
+func extractSessionHint(c fiber.Ctx, user string) string {
+	for _, h := range []string{"x-opencode-session", "x-session-id", "x-conversation-id", "session-id"} {
+		if v := strings.TrimSpace(c.Get(h)); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(user)
+}
+
+// extractClientIdentity computes a stable identifier for the downstream client.
+func extractClientIdentity(c fiber.Ctx) string {
+	if auth := strings.TrimSpace(c.Get("Authorization")); auth != "" {
+		h := sha256.Sum256([]byte(auth))
+		return hex.EncodeToString(h[:16])
+	}
+	return c.IP()
 }

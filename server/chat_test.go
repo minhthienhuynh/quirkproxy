@@ -489,3 +489,48 @@ func TestChatRequestParsesToolHistory(t *testing.T) {
 		t.Fatalf("ToolCallID not parsed: %q / %q", msgs[2].ToolCallID, msgs[3].ToolCallID)
 	}
 }
+
+func TestChatSessionAndIdentityExtraction(t *testing.T) {
+	fake := &fakeChat{fakeLister: fakeLister{id: "opencode",
+		models: []model.Model{{ID: "mimo-v2.6-flash-free", Owner: "opencode"}}},
+		chatRes: provider.ChatResult{Content: "OK"}}
+	app := New(chatReg(t, fake), testLogger())
+
+	raw, _ := json.Marshal(map[string]any{
+		"model":    "mimo-v2.6-flash-free",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-session-id", "ses_test_123")
+	req.Header.Set("Authorization", "Bearer secret-token")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	resp.Body.Close()
+
+	if fake.lastReq.SessionID != "ses_test_123" {
+		t.Fatalf("SessionID = %q, want ses_test_123", fake.lastReq.SessionID)
+	}
+	if fake.lastReq.ClientIdentity == "" {
+		t.Fatalf("ClientIdentity is empty")
+	}
+
+	raw2, _ := json.Marshal(map[string]any{
+		"model":    "mimo-v2.6-flash-free",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"user":     "user_conversation_999",
+	})
+	req2, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw2))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := app.Test(req2)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	resp2.Body.Close()
+
+	if fake.lastReq.SessionID != "user_conversation_999" {
+		t.Fatalf("SessionID from user field = %q, want user_conversation_999", fake.lastReq.SessionID)
+	}
+}

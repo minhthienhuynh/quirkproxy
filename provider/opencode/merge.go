@@ -74,6 +74,10 @@ func New(cfg config.Provider, logger *slog.Logger) *Provider {
 		genTimeout: durationOption(cfg.Options, "inference_generation_timeout", defaultInferenceGenerationTimeout),
 		recipe: recipeFromOptions(cfg.Options,
 			stringOption(cfg.Options, "zen_api_url", "https://opencode.ai/inference/v1")),
+		sessions: newSessionManager(
+			durationOption(cfg.Options, "session_ttl", defaultSessionTTL),
+			intOption(cfg.Options, "session_max_size", defaultMaxSessions),
+		),
 	}
 	return p
 }
@@ -121,6 +125,22 @@ func durationOption(opts map[string]any, key string, fallback time.Duration) tim
 	return d
 }
 
+func intOption(opts map[string]any, key string, fallback int) int {
+	if v, ok := opts[key]; ok {
+		switch n := v.(type) {
+		case int:
+			if n > 0 {
+				return n
+			}
+		case float64:
+			if n > 0 {
+				return int(n)
+			}
+		}
+	}
+	return fallback
+}
+
 var (
 	_ provider.ModelLister        = (*Provider)(nil)
 	_ provider.ChatCompleter      = (*Provider)(nil)
@@ -142,12 +162,12 @@ func (p *Provider) Chat(ctx context.Context, req provider.ChatRequest) (provider
 
 // ChatRaw implements provider.ChatCompleter.
 func (p *Provider) ChatRaw(ctx context.Context, req provider.ChatRequest) (io.ReadCloser, error) {
-	return p.chat.postRaw(ctx, buildBody(req, req.Model))
+	return p.chat.postRaw(ctx, buildBody(req, req.Model), req.SessionID, req.ClientIdentity)
 }
 
 // Responses implements provider.ResponsesCompleter.
 func (p *Provider) Responses(ctx context.Context, req provider.ResponsesRequest) (provider.ResponsesResult, error) {
-	raw, err := p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model))
+	raw, err := p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model), req.SessionID, req.ClientIdentity)
 	if err != nil {
 		return provider.ResponsesResult{}, err
 	}
@@ -165,7 +185,7 @@ func (p *Provider) Responses(ctx context.Context, req provider.ResponsesRequest)
 
 // ResponsesRaw implements provider.ResponsesCompleter.
 func (p *Provider) ResponsesRaw(ctx context.Context, req provider.ResponsesRequest) (io.ReadCloser, error) {
-	return p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model))
+	return p.chat.postResponsesRaw(ctx, buildRespBody(req, req.Model), req.SessionID, req.ClientIdentity)
 }
 
 // ListModels implements provider.ModelLister.
