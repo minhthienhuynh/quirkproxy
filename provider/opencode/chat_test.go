@@ -248,45 +248,47 @@ func TestUpstreamErrorCapturesRetryAfter(t *testing.T) {
 	}
 }
 
-func TestChatRecipeKeylessAndAuthHeader(t *testing.T) {
-	var gotAuth string
+func TestChatRecipeGenuineAuthHeader(t *testing.T) {
+	var gotAuth, gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
+		gotUA = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer srv.Close()
 
-	// Default (public/keyless): Authorization header must be omitted
+	// Default: the genuine marker is always sent — never omitted, never keyless.
 	c1 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
-	_, err := c1.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
-	if err != nil {
+	if _, err := c1.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m"); err != nil {
 		t.Fatalf("chat default: %v", err)
 	}
-	if gotAuth != "" {
-		t.Fatalf("keyless default Authorization = %q, want omitted", gotAuth)
+	if gotAuth != "Bearer public" {
+		t.Fatalf("default Authorization = %q, want Bearer public", gotAuth)
+	}
+	if gotUA != "opencode/latest/2.0.32/cli" {
+		t.Fatalf("default User-Agent = %q, want pinned opencode/latest/2.0.32/cli", gotUA)
 	}
 
-	// Explicit key: Authorization header must be sent
-	c2 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(map[string]any{
+	// Env vars are not a marker source: the default stays the genuine marker.
+	t.Setenv("OPENCODE_API_KEY", "env_token_456")
+	t.Setenv("ZEN_API_KEY", "env_token_789")
+	c2 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
+	if _, err := c2.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m"); err != nil {
+		t.Fatalf("chat with env keys: %v", err)
+	}
+	if gotAuth != "Bearer public" {
+		t.Fatalf("Authorization with env keys = %q, want Bearer public (env is not a marker source)", gotAuth)
+	}
+
+	// Explicit key: sent verbatim.
+	c3 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(map[string]any{
 		"zen_api_key": "st_token_123",
 	}, srv.URL)}
-	_, err = c2.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
-	if err != nil {
+	if _, err := c3.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m"); err != nil {
 		t.Fatalf("chat with key: %v", err)
 	}
 	if gotAuth != "Bearer st_token_123" {
 		t.Fatalf("Authorization with key = %q, want Bearer st_token_123", gotAuth)
-	}
-
-	// Environment variable fallback
-	t.Setenv("OPENCODE_API_KEY", "env_token_456")
-	c3 := &zenChatClient{client: srv.Client(), recipe: recipeFromOptions(nil, srv.URL)}
-	_, err = c3.chat(context.Background(), provider.ChatRequest{Model: "m"}, "m")
-	if err != nil {
-		t.Fatalf("chat with env key: %v", err)
-	}
-	if gotAuth != "Bearer env_token_456" {
-		t.Fatalf("Authorization with env key = %q, want Bearer env_token_456", gotAuth)
 	}
 }
