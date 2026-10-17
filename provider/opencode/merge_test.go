@@ -181,6 +181,21 @@ func TestMergeTransportAndEndpoint(t *testing.T) {
 	}
 }
 
+func TestDefaultZenAPIURL(t *testing.T) {
+	// Pinned genuine endpoint: a stale default fails closed with 403.
+	p := New(testConfig(), nil)
+	if got, want := p.chat.recipe.BaseURL, "https://opencode.ai/inference/openai/v1"; got != want {
+		t.Fatalf("default zen_api_url = %q, want %q", got, want)
+	}
+
+	cfg := testConfig()
+	cfg.Options = map[string]any{"zen_api_url": "https://example.invalid/v1/"}
+	p = New(cfg, nil)
+	if got, want := p.chat.recipe.BaseURL, "https://example.invalid/v1"; got != want {
+		t.Fatalf("override zen_api_url = %q, want %q (trailing slash trimmed)", got, want)
+	}
+}
+
 func TestVariantsBudgetTokens(t *testing.T) {
 	got := variants([]devReasoningOption{{Type: "budget_tokens", Min: 100, Max: 1000}})
 	if len(got) != 2 || got["high"].ReasoningEffort != "high" || got["max"].ReasoningEffort != "max" {
