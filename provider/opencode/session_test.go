@@ -122,3 +122,36 @@ func TestSessionManagerConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestHermesSessionLifecycle(t *testing.T) {
+	sm := newSessionManager(30*time.Minute, 1000)
+
+	// Case 1: In-session turns (Hermes keeps session_id across turns)
+	hermesSessionID := "20261017_040311_4a0047d7"
+	turn1Ses := sm.Resolve(hermesSessionID, "hermes-agent")
+	turn2Ses := sm.Resolve(hermesSessionID, "hermes-agent")
+
+	if !isNativeSessionID(turn1Ses) {
+		t.Fatalf("turn 1 session is not native format: %q", turn1Ses)
+	}
+	if turn1Ses != turn2Ses {
+		t.Fatalf("in-session turns must produce identical upstream session IDs: %q != %q", turn1Ses, turn2Ses)
+	}
+
+	// Case 2: New session (e.g. user types /new or session rotates)
+	newHermesSessionID := "20261017_052000_9b8a7c6d"
+	newSes := sm.Resolve(newHermesSessionID, "hermes-agent")
+
+	if !isNativeSessionID(newSes) {
+		t.Fatalf("new session is not native format: %q", newSes)
+	}
+	if newSes == turn1Ses {
+		t.Fatalf("new session must produce a different upstream session ID from old session: %q == %q", newSes, turn1Ses)
+	}
+
+	// Case 3: In-session turns inside the new session remain stable
+	newSesTurn2 := sm.Resolve(newHermesSessionID, "hermes-agent")
+	if newSes != newSesTurn2 {
+		t.Fatalf("turns within new session must remain stable: %q != %q", newSes, newSesTurn2)
+	}
+}
