@@ -76,12 +76,17 @@ func newSessionManager(ttl time.Duration, maxSize int) *SessionManager {
 }
 
 // Resolve returns the appropriate session ID.
-//  1. If hint == "new" or hint == "reset", the client's cached session is evicted
+//  1. If hint is non-empty (and not a reset directive), it is translated
+//     (or passed through if native) without acquiring the mutex.
+//  2. If hint == "new" or hint == "reset", the client's cached session is evicted
 //     and a fresh session ID is minted and stored.
-//  2. If hint is non-empty, it is translated (or passed through if native).
 //  3. Otherwise, a stable cached session is reused for clientID within ttl.
 //  4. If no cached session exists or it expired, a fresh session ID is minted.
 func (sm *SessionManager) Resolve(hint, clientID string) string {
+	if hint != "" && hint != "new" && hint != "reset" {
+		return translateSessionID(hint)
+	}
+
 	if clientID == "" {
 		clientID = "default"
 	}
@@ -102,10 +107,6 @@ func (sm *SessionManager) Resolve(hint, clientID string) string {
 			lastUsed:  now,
 		}
 		return newID
-	}
-
-	if hint != "" {
-		return translateSessionID(hint)
 	}
 
 	if entry, ok := sm.sessions[clientID]; ok {
