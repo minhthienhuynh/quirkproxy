@@ -18,8 +18,8 @@ buffered instead: one full chunk plus a single proxy-emitted `[DONE]`.
 
 - `User-Agent`: `opencode/latest/2.0.32/cli`
   (override via options `user_agent`; a stale pin fails closed with 403)
-- Headers: `Authorization: Bearer <key>` when `zen_api_key` or `OPENCODE_API_KEY`/`ZEN_API_KEY`
-  is configured; omitted in keyless mode (default `public`/empty). `x-opencode-client: cli`,
+- Headers: `Authorization: Bearer <key>` always — key from the `zen_api_key` option,
+  default `public` (the genuine marker; no keyless mode). `x-opencode-client: cli`,
   `x-opencode-project: global`, session affinity headers `x-opencode-session`, `x-opencode-session-id`,
   `x-session-affinity`, `x-session-id` (`ses_` + 12hex + 14base62) per call.
 - Session id: `ses_` + 12hex + 14base62; the 12 hex pack `~(ms*4096 + counter)` and the
@@ -96,7 +96,7 @@ empty, or non-positive):
 
 ## Test cross-reference
 
-- Recipe headers/body/IDs: `provider/opencode/chat_test.go` → `TestChatRecipeHeaders`
+- Recipe headers/body/IDs: `provider/opencode/chat_test.go` → `TestChatRecipeHeaders`, `TestChatRecipeGenuineAuthHeader`
 - Session id counter semantics + gate bound regression: `provider/opencode/session_test.go` → `TestNewSessionIDCounterResetsPerMillisecond`, `TestNewSessionIDCounterStaysWithinGateBound`
 - SSE aggregation + tool-call merge: `TestChatSSEAggregation`
 - 403+hint passthrough, single upstream hit: `TestChatUpstreamErrors`
