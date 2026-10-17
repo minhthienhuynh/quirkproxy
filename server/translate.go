@@ -28,7 +28,12 @@ func chatToResponses(req provider.ChatRequest) provider.ResponsesRequest {
 		}
 		input = items
 	}
-	out := provider.ResponsesRequest{Model: req.Model, Input: input}
+	out := provider.ResponsesRequest{
+		Model:          req.Model,
+		Input:          input,
+		SessionID:      req.SessionID,
+		ClientIdentity: req.ClientIdentity,
+	}
 	for _, t := range req.Tools {
 		out.Tools = append(out.Tools, provider.ResponsesTool{
 			Name: t.Name, Description: t.Description, Parameters: t.Parameters,
@@ -75,7 +80,11 @@ func chatMessageToInputItems(m provider.ChatMessage) []any {
 // String input becomes one user message; array input extracts role/text.
 // reasoning is dropped: the chat wire has no equivalent.
 func responsesToChat(req provider.ResponsesRequest) provider.ChatRequest {
-	out := provider.ChatRequest{Model: req.Model}
+	out := provider.ChatRequest{
+		Model:          req.Model,
+		SessionID:      req.SessionID,
+		ClientIdentity: req.ClientIdentity,
+	}
 	switch in := req.Input.(type) {
 	case nil:
 		break

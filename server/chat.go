@@ -25,6 +25,7 @@ type chatRequest struct {
 	Stream      bool          `json:"stream"`
 	Temperature *float64      `json:"temperature"`
 	MaxTokens   *int          `json:"max_tokens"`
+	User        string        `json:"user,omitempty"`
 }
 
 type chatMessage struct {
@@ -246,7 +247,14 @@ func chatHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler {
 		if req.Model == "" || len(req.Messages) == 0 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "model and messages are required"})
 		}
-		chatReq := provider.ChatRequest{Model: req.Model, ToolChoice: req.ToolChoice, Temperature: req.Temperature, MaxTokens: req.MaxTokens}
+		chatReq := provider.ChatRequest{
+			Model:          req.Model,
+			ToolChoice:     req.ToolChoice,
+			Temperature:    req.Temperature,
+			MaxTokens:      req.MaxTokens,
+			SessionID:      extractSessionHint(c, req.User),
+			ClientIdentity: extractClientIdentity(c),
+		}
 		for _, m := range req.Messages {
 			cm := provider.ChatMessage{Role: m.Role, Content: m.Content.Text, ToolCallID: m.ToolCallID}
 			for _, tc := range m.ToolCalls {

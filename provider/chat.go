@@ -31,12 +31,14 @@ type ChatTool struct {
 
 // ChatRequest is the normalized input for one chat inference call.
 type ChatRequest struct {
-	Model       string
-	Messages    []ChatMessage
-	Tools       []ChatTool
-	ToolChoice  any
-	Temperature *float64
-	MaxTokens   *int
+	Model          string
+	Messages       []ChatMessage
+	Tools          []ChatTool
+	ToolChoice     any
+	Temperature    *float64
+	MaxTokens      *int
+	SessionID      string
+	ClientIdentity string
 }
 
 // ToolCall is one assistant-requested tool invocation.

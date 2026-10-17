@@ -23,6 +23,7 @@ type responsesRequest struct {
 	Reasoning       any                 `json:"reasoning"`
 	Stream          bool                `json:"stream"`
 	MaxOutputTokens *int                `json:"max_output_tokens"`
+	User            string              `json:"user,omitempty"`
 }
 
 type responsesWireTool struct {
@@ -73,6 +74,8 @@ func responsesHandler(reg *provider.Registry, logger *slog.Logger) fiber.Handler
 			Input:           req.Input,
 			Reasoning:       req.Reasoning,
 			MaxOutputTokens: req.MaxOutputTokens,
+			SessionID:       extractSessionHint(c, req.User),
+			ClientIdentity:  extractClientIdentity(c),
 		}
 		for _, t := range req.Tools {
 			respReq.Tools = append(respReq.Tools, provider.ResponsesTool{

@@ -79,12 +79,12 @@ func newRespID() (string, error) {
 
 // postResponsesRaw sends the body with the genuine recipe and returns the
 // raw SSE stream on 200. No retries: a 4xx is a decision, quota is precious.
-func (c *zenChatClient) postResponsesRaw(ctx context.Context, body respBody) (io.ReadCloser, error) {
+func (c *zenChatClient) postResponsesRaw(ctx context.Context, body respBody, hints ...string) (io.ReadCloser, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("encode responses: %w", err)
 	}
-	return c.postToPath(ctx, "/responses", payload, "responses")
+	return c.postToPath(ctx, "/responses", payload, "responses", hints...)
 }
 
 // Terminal Responses SSE events. The final response object arrives on

@@ -231,3 +231,31 @@ func TestResponsesScoped(t *testing.T) {
 		t.Fatalf("model outside allowlist status = %d, want 404", code)
 	}
 }
+
+func TestResponsesSessionAndIdentityExtraction(t *testing.T) {
+	fake := &fakeResponses{fakeLister: fakeLister{id: "opencode",
+		models: []model.Model{{ID: "m", Owner: "opencode"}}},
+		respRes: provider.ResponsesResult{Payload: []byte(`{"id":"resp-x","object":"response","model":"m"}`)}}
+	app := New(responsesReg(t, fake), testLogger())
+
+	raw, _ := json.Marshal(map[string]any{
+		"model": "m",
+		"input": "hi",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-opencode-session", "ses_responses_456")
+	req.Header.Set("Authorization", "Bearer test-auth")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	resp.Body.Close()
+
+	if fake.lastReq.SessionID != "ses_responses_456" {
+		t.Fatalf("SessionID = %q, want ses_responses_456", fake.lastReq.SessionID)
+	}
+	if fake.lastReq.ClientIdentity == "" {
+		t.Fatalf("ClientIdentity is empty")
+	}
+}
