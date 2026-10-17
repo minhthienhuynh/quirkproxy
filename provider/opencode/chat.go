@@ -66,18 +66,31 @@ const (
 
 var (
 	idCounter uint32
+	idLastMs  int64
 	idMu      sync.Mutex
 )
 
 // newSessionID generates ses_<12hex><14base62> using OpenCode v2's descending timestamp format.
 func newSessionID() (string, error) {
+	return newSessionIDAt(time.Now().UnixMilli())
+}
+
+// newSessionIDAt is newSessionID with an injectable clock. It mirrors the
+// genuine client's SMn: the counter counts mints within one millisecond and
+// resets when the timestamp advances, keeping the packed counter inside the
+// gate's accepted range (< 64) for the whole process lifetime instead of
+// climbing without bound.
+func newSessionIDAt(ms int64) (string, error) {
 	idMu.Lock()
-	now := time.Now().UnixMilli()
+	if ms != idLastMs {
+		idLastMs = ms
+		idCounter = 0
+	}
 	idCounter++
 	cnt := idCounter
 	idMu.Unlock()
 
-	current := uint64(now)*4096 + uint64(cnt%4096)
+	current := uint64(ms)*4096 + uint64(cnt%4096)
 	val := ^current
 
 	timeBytes := make([]byte, 6)

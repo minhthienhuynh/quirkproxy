@@ -1,6 +1,8 @@
 package opencode
 
 import (
+	"encoding/hex"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -153,5 +155,69 @@ func TestHermesSessionLifecycle(t *testing.T) {
 	newSesTurn2 := sm.Resolve(newHermesSessionID, "hermes-agent")
 	if newSes != newSesTurn2 {
 		t.Fatalf("turns within new session must remain stable: %q != %q", newSes, newSesTurn2)
+	}
+}
+
+// decodeSessionCounter extracts the counter packed into a ses_ id's first 12
+// hex chars (the payload is the bitwise inverse of ms*4096+counter).
+func decodeSessionCounter(t *testing.T, id string) uint32 {
+	t.Helper()
+	const prefix = "ses_"
+	if !strings.HasPrefix(id, prefix) || len(id) != len(prefix)+12+14 {
+		t.Fatalf("decodeSessionCounter: not a ses_ id: %q", id)
+	}
+	raw, err := hex.DecodeString(id[len(prefix) : len(prefix)+12])
+	if err != nil {
+		t.Fatalf("decodeSessionCounter: hex decode %q: %v", id, err)
+	}
+	var val uint64
+	for _, b := range raw {
+		val = val<<8 | uint64(b)
+	}
+	return uint32((^val) % 4096)
+}
+
+// TestNewSessionIDCounterStaysWithinGateBound is the regression for the 403
+// storm: the old monotonic counter left the gate's accepted range after 64
+// mints in one process lifetime. The genuine client resets its counter every
+// millisecond, so minting at a realistic cadence must keep the packed counter
+// < 64 for the whole run.
+func TestNewSessionIDCounterStaysWithinGateBound(t *testing.T) {
+	for i := 1; i <= 200; i++ {
+		id, err := newSessionID()
+		if err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+		if got := decodeSessionCounter(t, id); got >= 64 {
+			t.Fatalf("mint %d: counter = %d, want < 64 (gate bound)", i, got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestNewSessionIDCounterResetsPerMillisecond mirrors the genuine client's
+// SMn: within one millisecond the counter increments; when the timestamp
+// advances it resets to 1, so the packed counter never rots with uptime.
+func TestNewSessionIDCounterResetsPerMillisecond(t *testing.T) {
+	mint := func(ms int64) uint32 {
+		t.Helper()
+		id, err := newSessionIDAt(ms)
+		if err != nil {
+			t.Fatalf("mint at %d: %v", ms, err)
+		}
+		return decodeSessionCounter(t, id)
+	}
+	const ms = int64(1734567890123)
+	if got := mint(ms); got != 1 {
+		t.Fatalf("first mint in a fresh millisecond: counter = %d, want 1", got)
+	}
+	if got := mint(ms); got != 2 {
+		t.Fatalf("second mint in the same millisecond: counter = %d, want 2", got)
+	}
+	if got := mint(ms + 1); got != 1 {
+		t.Fatalf("first mint after the millisecond advanced: counter = %d, want reset to 1", got)
+	}
+	if got := mint(ms + 1); got != 2 {
+		t.Fatalf("second mint in the new millisecond: counter = %d, want 2", got)
 	}
 }
