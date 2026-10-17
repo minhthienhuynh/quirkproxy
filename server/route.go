@@ -111,6 +111,12 @@ func setSSEHeaders(c fiber.Ctx) {
 // extractSessionHint returns the first non-empty session identifier from headers
 // or the OpenAI user field.
 func extractSessionHint(c fiber.Ctx, user string) string {
+	if reset := c.Get("x-reset-session"); reset == "true" || reset == "1" {
+		return "new"
+	}
+	if reset := c.Get("x-new-session"); reset == "true" || reset == "1" {
+		return "new"
+	}
 	for _, h := range []string{"x-opencode-session", "x-session-id", "x-conversation-id", "session-id"} {
 		if v := strings.TrimSpace(c.Get(h)); v != "" {
 			return v

@@ -533,4 +533,18 @@ func TestChatSessionAndIdentityExtraction(t *testing.T) {
 	if fake.lastReq.SessionID != "user_conversation_999" {
 		t.Fatalf("SessionID from user field = %q, want user_conversation_999", fake.lastReq.SessionID)
 	}
+
+	// Test 3: x-reset-session forces "new"
+	req3, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw))
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("x-reset-session", "true")
+	resp3, err := app.Test(req3)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	resp3.Body.Close()
+
+	if fake.lastReq.SessionID != "new" {
+		t.Fatalf("SessionID from x-reset-session = %q, want new", fake.lastReq.SessionID)
+	}
 }

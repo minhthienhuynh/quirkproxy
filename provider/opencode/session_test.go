@@ -90,6 +90,17 @@ func TestSessionManager(t *testing.T) {
 	if sesA1 == sesA3 {
 		t.Fatalf("session did not expire after TTL: %q == %q", sesA1, sesA3)
 	}
+
+	// Explicit reset request: evicts cache and generates new session
+	sesA4 := sm.Resolve("new", "client-A")
+	if sesA4 == sesA3 {
+		t.Fatalf("explicit reset did not generate new session: %q == %q", sesA4, sesA3)
+	}
+	// Subsequent call reuses the newly minted session
+	sesA5 := sm.Resolve("", "client-A")
+	if sesA5 != sesA4 {
+		t.Fatalf("subsequent call did not reuse reset session: %q != %q", sesA5, sesA4)
+	}
 }
 
 func TestSessionManagerConcurrent(t *testing.T) {
