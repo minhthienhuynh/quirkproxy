@@ -1,0 +1,27 @@
+[package]
+name = "quirkproxy"
+version = "1.0.0"
+edition = "2021"
+authors = ["Minh Thien Huynh"]
+description = "High-performance Rust Supervisor & Auto-Healing Reverse Proxy for OpenCode2API with Cloudflare WARP SOCKS5"
+
+[dependencies]
+axum = { version = "0.7", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["socks", "stream", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.0"
+http-body-util = "0.1"
+anyhow = "1.0"
+fastrand = "2.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

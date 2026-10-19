@@ -1,0 +1,7 @@
+/target/
+**/*.rs.bk
+
+# Environments and configs (runtime-generated)
+.env
+*.log
+config.json

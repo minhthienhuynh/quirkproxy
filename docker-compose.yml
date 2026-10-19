@@ -1,0 +1,32 @@
+services:
+  quirkproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: quirkproxy:v1
+    container_name: quirkproxy
+    restart: unless-stopped
+    environment:
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8080}
+      - OPENCODE2API_PORT=${OPENCODE2API_PORT:-18088}
+      - WARP_SOCKS_PORT=${WARP_SOCKS_PORT:-40000}
+      - WARP_ENABLED=${WARP_ENABLED:-true}
+      - WARP_AUTO_ROTATE_429=${WARP_AUTO_ROTATE_429:-true}
+      - WARP_AUTO_ROTATE_403=${WARP_AUTO_ROTATE_403:-true}
+      - WARP_ACCEPT_TOS=1
+      - SERVER_KEY=${SERVER_KEY:-local-test-key}
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:${QUIRK_HOST_PORT:-18080}:${PORT:-8080}"
+    networks:
+      - default
+      - dokploy-network
+
+networks:
+  default:
+  dokploy-network:
+    external: true
