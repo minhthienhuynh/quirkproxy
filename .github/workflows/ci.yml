@@ -2,7 +2,8 @@ name: ci
 
 on:
   push:
-    branches: [v1, main]
+    branches: [main, v1]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -10,13 +11,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Format, lint and unit tests. Runs on every push and PR.
   test:
-    name: fmt + clippy + tests + docker build
-    runs-on: ubuntu-latest
+    name: fmt + clippy + tests
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -25,8 +28,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -37,7 +39,86 @@ jobs:
       - name: tests
         run: cargo test --release
 
-      # The Dockerfile copies Cargo.lock, so a repo missing it fails only at
-      # build time. Run the real build so that cannot regress silently.
-      - name: docker build
-        run: docker build -t quirkproxy:ci .
+  # Real image build and push. The Dockerfile copies Cargo.lock, so a repo
+  # missing it used to fail only here -- that regression stayed invisible.
+  build:
+    name: docker build + push
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only authenticate when a push will actually happen (not on PRs).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Redeploy the Dokploy compose so a new tag actually reaches the host.
+  deploy:
+    name: trigger dokploy
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Dokploy deployment
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+        run: |
+          : "${DOKPLOY_URL:?missing DOKPLOY_URL secret}"
+          : "${DOKPLOY_API_KEY:?missing DOKPLOY_API_KEY secret}"
+          : "${DOKPLOY_COMPOSE_ID:?missing DOKPLOY_COMPOSE_ID secret}"
+          base="${DOKPLOY_URL%/}"
+          payload="{\"composeId\":\"$DOKPLOY_COMPOSE_ID\"}"
+          body_file=$(mktemp)
+          code=$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' -X POST \
+            -H "x-api-key: $DOKPLOY_API_KEY" \
+            -H 'Content-Type: application/json' \
+            "$base/api/compose.redeploy" \
+            -d "$payload") || true
+          echo "compose.redeploy -> HTTP $code"
+          cat "$body_file"; echo
+          rm -f "$body_file"
+          case "$code" in
+            2*) echo 'Dokploy redeploy triggered' ;;
+            401|403) echo 'ERROR: Unauthorized/Forbidden -- check DOKPLOY_API_KEY access to the compose'; exit 1 ;;
+            404) echo 'ERROR: Not found -- check DOKPLOY_URL (panel base, no /api suffix) and DOKPLOY_COMPOSE_ID'; exit 1 ;;
+            000) echo 'ERROR: Could not reach Dokploy -- DOKPLOY_URL must be a public URL'; exit 1 ;;
+            *) echo 'ERROR: Trigger failed'; exit 1 ;;
+          esac
