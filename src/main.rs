@@ -1,4 +1,5 @@
 mod config;
+mod gate;
 mod proxy;
 mod warp;
 
@@ -22,6 +23,18 @@ use tracing::{error, info, warn};
 use config::Config;
 use proxy::AppState;
 use warp::WarpManager;
+
+/// How long to wait for the engine to answer /healthz after spawning it.
+/// The engine returns 503 until its model catalog refresh succeeds, which
+/// takes ~10-15s on a cold WARP tunnel; 60s leaves room for one retry.
+const ENGINE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Poll interval while waiting for the engine.
+const ENGINE_READY_POLL: Duration = Duration::from_millis(500);
+/// A child that survived this long is considered healthy enough to restart
+/// immediately instead of backing off (crash loop vs. one-off crash).
+const ENGINE_STABLE_UPTIME: Duration = Duration::from_secs(30);
+/// Grace period for the engine to exit after SIGKILL on shutdown.
+const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn ensure_opencode2api_config(config: &Config) -> Result<()> {
     // The config is fully derived from env, so it must be regenerated on each boot.
@@ -75,7 +88,10 @@ fn ensure_opencode2api_config(config: &Config) -> Result<()> {
     )
     .context("failed to write opencode2api config.json")?;
 
-    info!("Generated opencode2api config at {}", config.opencode2api_config);
+    info!(
+        "Generated opencode2api config at {}",
+        config.opencode2api_config
+    );
     Ok(())
 }
 
@@ -85,7 +101,10 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
     let mut backoff = Duration::from_secs(1);
 
     while !shutdown.load(Ordering::Relaxed) {
-        info!("Spawning opencode2api core engine (binary: {})...", config.opencode2api_bin);
+        info!(
+            "Spawning opencode2api core engine (binary: {})...",
+            config.opencode2api_bin
+        );
         let child = Command::new(&config.opencode2api_bin)
             .args(["-config", &config.opencode2api_config])
             .kill_on_drop(true)
@@ -94,7 +113,10 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to spawn opencode2api: {}. Retrying in {:?}", e, backoff);
+                error!(
+                    "Failed to spawn opencode2api: {}. Retrying in {:?}",
+                    e, backoff
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
@@ -109,7 +131,7 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
                 let uptime = started.elapsed();
                 warn!("opencode2api exited ({:?}) after {:?}", status, uptime);
                 // If it ran a while before dying, restart immediately.
-                if uptime >= Duration::from_secs(30) {
+                if uptime >= ENGINE_STABLE_UPTIME {
                     continue;
                 }
             }
@@ -143,7 +165,10 @@ async fn main() -> Result<()> {
     info!("=== Starting QuirkProxy (Rust Supervisor + OpenCode2API Core Engine) ===");
 
     let config = Config::from_env();
-    let warp = Arc::new(WarpManager::new(config.warp_socks_port, config.warp_enabled));
+    let warp = Arc::new(WarpManager::new(
+        config.warp_socks_port,
+        config.warp_enabled,
+    ));
 
     // 1. Initialize Cloudflare WARP SOCKS5 client
     if let Err(e) = warp.start().await {
@@ -174,11 +199,15 @@ async fn main() -> Result<()> {
         .build()?;
 
     let health_url = format!("{}/healthz", config.upstream_api);
-    info!("Waiting for opencode2api engine to report healthy on {}...", health_url);
+    info!(
+        "Waiting for opencode2api engine to report healthy on {}...",
+        health_url
+    );
 
     let mut ready = false;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = tokio::time::Instant::now() + ENGINE_READY_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(ENGINE_READY_POLL).await;
         if let Ok(resp) = http_client
             .get(&health_url)
             .timeout(Duration::from_secs(2))
@@ -233,7 +262,7 @@ async fn main() -> Result<()> {
 
     // Signal the supervisor to stop and reap the engine child process
     shutdown.store(true, Ordering::Relaxed);
-    let _ = tokio::time::timeout(Duration::from_secs(10), engine_task).await;
+    let _ = tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, engine_task).await;
     info!("Supervisor stopped opencode2api child process.");
 
     Ok(())

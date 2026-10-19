@@ -1,5 +1,24 @@
 use std::env;
 
+/// Reads a boolean env var, accepting `1/true/yes/on` (case-insensitive).
+fn env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+/// Reads a numeric env var, falling back to `default` on absence or parse error.
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Public listen host (default: 0.0.0.0)
@@ -40,38 +59,20 @@ impl Config {
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080);
 
-        let opencode_api_port = env::var("OPENCODE2API_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(18088);
-
+        let opencode_api_port = env_parse("OPENCODE2API_PORT", 18088);
         let upstream_api = env::var("UPSTREAM_API")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", opencode_api_port));
-
-        let warp_socks_port = env::var("WARP_SOCKS_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(40000);
 
         Self {
             host,
             port,
             opencode_api_port,
             upstream_api,
-            warp_socks_port,
-            warp_enabled: env::var("WARP_ENABLED")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
-            warp_auto_rotate_429: env::var("WARP_AUTO_ROTATE_429")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
-            warp_auto_rotate_403: env::var("WARP_AUTO_ROTATE_403")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
-            max_retries: env::var("MAX_RETRIES")
-                .ok()
-                .and_then(|r| r.parse().ok())
-                .unwrap_or(3),
+            warp_socks_port: env_parse("WARP_SOCKS_PORT", 40000),
+            warp_enabled: env_bool("WARP_ENABLED", true),
+            warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
+            warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
+            max_retries: env_parse("MAX_RETRIES", 3).max(1),
             opencode2api_bin: env::var("OPENCODE2API_BIN")
                 .unwrap_or_else(|_| "/usr/local/bin/opencode2api".to_string()),
             opencode2api_config: env::var("OPENCODE2API_CONFIG")

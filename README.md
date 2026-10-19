@@ -5,7 +5,9 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 ## Highlights
 
 - **Zero-Maintenance Core Engine**: Powered by upstream `opencode2api` (Go 1.24+ binary, v1.4.2). Automatically supports all upstream OpenCode gates (Bun uTLS fingerprinting, descending session IDs, genuine byte-matched tool schemas, and multi-protocol translation for OpenAI Chat, Responses, and Anthropic Messages).
-- **Auto-Healing IP Rotation in Rust**: Implemented in async Rust (Axum + Tokio + Reqwest) as a high-performance PID 1 supervisor. When upstream returns `HTTP 429` (Rate Limit) or `HTTP 403` (Abuse/FreeTierError), the supervisor immediately triggers Cloudflare WARP re-registration to draw a new `104.28.*.*` egress IP, and transparently retries the request.
+- **Auto-Healing IP Rotation in Rust**: Implemented in async Rust (Axum + Tokio + Reqwest) as a high-performance PID 1 supervisor. When upstream returns `HTTP 429` (Rate Limit) or a rotation-eligible `HTTP 403`, the supervisor immediately triggers Cloudflare WARP re-registration to draw a new `104.28.*.*` egress IP, and transparently retries the request.
+- **Refusal-Aware Rotation**: A `403` is not one condition. The supervisor classifies the message into `quota` / `abuse` / `shape` / `geo` / `auth` / `version` and only rotates for the causes a new egress can actually fix. Rotating for a request-shape or region refusal spends a registration and ~5s while guaranteeing the same failure.
+- **Stream-Safe Rotation**: Every in-flight response holds a guard until its last byte, so a manual or scheduled rotation waits for the tunnel to drain instead of truncating another client's stream mid-token. `GET /healthz` exposes the live `inflight` count.
 - **Single Container Architecture**: Bundles `warp-svc`, `opencode2api`, and the Rust supervisor into a single Docker image without sidecars, extra proxy nodes, or dedupe arbiters.
 - **Zero Host Network Disruption**: WARP runs strictly in `mode proxy` (SOCKS5 on internal port `127.0.0.1:40000`). It does not create `tun0` virtual network interfaces, does not modify host routing tables, and leaves VPN / DNS / SSH untouched.
 - **High Concurrency & Minimal Footprint**: Rust supervisor consumes less than 15MB of RAM with sub-millisecond proxy latency.
@@ -74,9 +76,32 @@ services:
 
 ### Endpoints
 
-- `GET /healthz` — Liveness & status probe (QuirkProxy, WARP status, opencode2api health).
-- `POST /v1/rotate` — Manually trigger a WARP IP rotation.
+- `GET /healthz` — Liveness & status probe. `status` is `healthy` (engine ready), `warming` (engine reachable but its model catalog is still loading) or `degraded` (engine unreachable). Also reports `inflight` and `engine_models`.
+- `POST /v1/rotate` — Trigger a WARP IP rotation. Requires `Authorization: Bearer $SERVER_KEY`; waits for in-flight streams to drain first.
 - `GET /v1/models` — Proxied directly to opencode2api.
-- `POST /v1/chat/completions` — Proxied with automatic 429/403 retry.
+- `POST /v1/chat/completions` — Proxied with automatic refusal-aware 429/403 retry.
 - `POST /v1/responses` — Proxied to opencode2api Responses endpoint.
 - `POST /v1/messages` — Proxied to opencode2api Anthropic endpoint.
+
+## Rotation policy
+
+| Upstream refusal | Rotates? | Why |
+| :--- | :--- | :--- |
+| `429` rate limit | yes | per-address quota |
+| `403` quota / usage limit | yes | per-address quota |
+| `403` abuse | yes | address flagged |
+| `403` unrecognised | yes | most likely an exhausted address; one wasted rotation is cheaper than a hard failure |
+| `403` request shape | **no** | headers/tools/session id — no address makes it pass |
+| `403` region block | **no** | a new registration stays in the same colo |
+| `403` auth / version | **no** | not an egress problem |
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --release
+docker build -t quirkproxy:v1 .
+```
+
+CI runs exactly those four steps on every push and PR.

@@ -13,6 +13,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::gate::{classify_403, RefusalKind};
 use crate::warp::WarpManager;
 
 /// Max buffered request body (32 MiB). The body must be buffered to allow
@@ -45,30 +46,68 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let warp_status = state.warp.status().await;
-    let opencode_ok = state
+
+    // The engine reports 503 while its model catalog is refreshing (cold start
+    // or a transient upstream blip) but still serves requests. Distinguish
+    // "can serve" from "fully warmed" so the container is not marked degraded
+    // for a condition that resolves itself.
+    let engine = match state
         .http_client
         .get(format!("{}/healthz", state.config.upstream_api))
         .timeout(Duration::from_secs(3))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            EngineHealth {
+                reachable: true,
+                // A 503 with models still loading is "warming", not "down".
+                ready: status.is_success(),
+                models_loaded: body["models"]["exposed"].as_u64().unwrap_or(0),
+            }
+        }
+        Err(_) => EngineHealth {
+            reachable: false,
+            ready: false,
+            models_loaded: 0,
+        },
+    };
+
+    let overall = match (engine.reachable, engine.ready) {
+        (true, true) => "healthy",
+        (true, false) => "warming",
+        (false, _) => "degraded",
+    };
 
     // Always 200 for container liveness; health detail is in the JSON body.
     (
         StatusCode::OK,
         Json(json!({
-            "status": if opencode_ok { "healthy" } else { "degraded" },
+            "status": overall,
             "service": "QuirkProxy",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "engine": "opencode2api",
-            "engine_online": opencode_ok,
+            "engine_online": engine.reachable,
+            "engine_ready": engine.ready,
+            "engine_models": engine.models_loaded,
+            "inflight": state.warp.inflight_count(),
             "warp": warp_status,
         })),
     )
 }
 
-pub async fn trigger_rotate(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+struct EngineHealth {
+    reachable: bool,
+    ready: bool,
+    models_loaded: u64,
+}
+
+pub async fn trigger_rotate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     if !state.config.warp_enabled {
         return (
             StatusCode::BAD_REQUEST,
@@ -97,7 +136,11 @@ pub async fn trigger_rotate(State(state): State<AppState>, headers: HeaderMap) -
         );
     }
 
-    match state.warp.rotate("Manual API Trigger (/v1/rotate)").await {
+    match state
+        .warp
+        .rotate("Manual API Trigger (/v1/rotate)", true)
+        .await
+    {
         Ok(new_ip) => (
             StatusCode::OK,
             Json(json!({
@@ -166,7 +209,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             // Guard against OOM: prompts+images can be large, but unbounded buffering
             // of a multi-GB body would kill the container.
             if bytes.len() > MAX_BODY_BYTES {
-                warn!("Rejecting request body of {} bytes (limit {})", bytes.len(), MAX_BODY_BYTES);
+                warn!(
+                    "Rejecting request body of {} bytes (limit {})",
+                    bytes.len(),
+                    MAX_BODY_BYTES
+                );
                 return (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     Json(json!({ "error": { "message": "Request body too large" } })),
@@ -193,11 +240,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     while attempt < max_retries {
         attempt += 1;
 
+        // Retries get a fresh session id: reusing the failed session would
+        // poison the attempt even on a new egress address.
         let mut headers = forwarded_headers.clone();
-        // Inject fresh session ID on retries or when not supplied by client
         if attempt > 1 || !headers.contains_key("x-session-id") {
-            let ses = make_session_id();
-            if let Ok(val) = HeaderValue::from_str(&ses) {
+            if let Ok(val) = HeaderValue::from_str(&make_session_id()) {
                 headers.insert(HeaderName::from_static("x-session-id"), val);
             }
         }
@@ -237,36 +284,70 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             let err_bytes = res.bytes().await.unwrap_or_default();
             let err_text = String::from_utf8_lossy(&err_bytes);
 
-            let is_403_rotate_eligible = is_403
-                && {
-                    let lower = err_text.to_lowercase();
-                    err_text.contains("FreeTierError")
-                        || err_text.contains("Abuse")
-                        || err_text.contains("OpenCode Free Model Gateway")
-                        || lower.contains("forbidden")
-                        || lower.contains("rate limit")
-                };
+            // A 403 is not one condition. Only some causes are fixed by a new
+            // egress address; rotating for a shape/geo/auth refusal spends a
+            // registration and ~5s while guaranteeing the same failure.
+            let refusal = if is_403 {
+                Some(classify_403(&err_text))
+            } else {
+                None
+            };
 
-            let should_rotate = (is_429 && state.config.warp_auto_rotate_429)
-                || (is_403 && state.config.warp_auto_rotate_403 && is_403_rotate_eligible);
+            let should_rotate = match (is_429, refusal) {
+                (true, _) => state.config.warp_auto_rotate_429,
+                (false, Some(kind)) => state.config.warp_auto_rotate_403 && kind.rotate_eligible(),
+                (false, None) => false,
+            };
+
+            if is_403 {
+                if let Some(kind) = refusal {
+                    if !kind.rotate_eligible() {
+                        warn!(
+                            "403 classified as {} -- not rotating: {}",
+                            kind.as_str(),
+                            kind.advice()
+                        );
+                    }
+                }
+            }
 
             if should_rotate && state.config.warp_enabled && attempt < max_retries {
-                let err_kind = if is_429 { "RateLimit 429" } else { "Abuse 403" };
+                let err_kind = if is_429 {
+                    RefusalKind::Quota
+                } else {
+                    refusal.unwrap_or(RefusalKind::Unknown)
+                };
                 let err_old_ip = state.warp.status().await.current_ip;
                 warn!(
                     "Upstream returned {} ({}) - triggering WARP IP rotation (attempt {}/{})...",
-                    status, err_kind, attempt, max_retries
+                    status,
+                    err_kind.as_str(),
+                    attempt,
+                    max_retries
                 );
 
+                // This request already failed, so its own stream is gone; do not
+                // wait for the tunnel to drain, or every retry would inherit the
+                // latency of other clients' streams.
                 if let Ok(Some(new_ip)) = state
                     .warp
-                    .rotate(&format!("Upstream {} ({}) on attempt {}", status, err_kind, attempt))
+                    .rotate(
+                        &format!(
+                            "Upstream {} ({}) on attempt {}",
+                            status,
+                            err_kind.as_str(),
+                            attempt
+                        ),
+                        false,
+                    )
                     .await
                 {
-                    // rotate() returns the previous IP when throttled: retrying on the
-                    // same egress identity would just burn an attempt.
+                    // rotate() also returns the old IP when throttled, when the
+                    // tunnel refused to drain, or when 4 registrations all drew
+                    // the same address. Retrying on an unchanged identity only
+                    // burns the remaining attempts on a known-bad egress.
                     if Some(&new_ip) == err_old_ip.as_ref() {
-                        warn!("WARP rotation throttled; not retrying on the same IP.");
+                        warn!("WARP identity unchanged; not retrying on the same IP.");
                     } else {
                         info!("WARP rotated to new IP: {} - Retrying request...", new_ip);
                         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -276,31 +357,20 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             }
 
             // Return upstream error response if cannot rotate or exhausted retries
-            let mut response = Response::builder().status(status);
-            for (k, v) in &res_headers {
-                if !is_hop_by_hop(k) {
-                    response = response.header(k, v);
-                }
-            }
-            return response
-                .body(Body::from(err_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return build_response(status, &res_headers, Body::from(err_bytes));
         }
 
-        // Success or normal response -> stream back
-        let mut response_builder = Response::builder().status(status);
-        for (k, v) in res.headers() {
-            if !is_hop_by_hop(k) {
-                response_builder = response_builder.header(k, v);
-            }
-        }
+        // Success or normal response -> stream back.
+        // Copy end-to-end headers before `res` is consumed by bytes_stream().
+        let res_headers = res.headers().clone();
 
+        // The guard is moved into the body stream so the tunnel counts as busy
+        // until the last byte reaches the client, not just until headers arrive.
+        let guard = state.warp.begin_request();
         let stream = res.bytes_stream();
-        let body = Body::from_stream(stream);
+        let body = Body::from_stream(StreamGuard::new(guard, stream));
 
-        return response_builder
-            .body(body)
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return build_response(status, &res_headers, body);
     }
 
     (
@@ -308,4 +378,48 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         Json(json!({ "error": { "message": "All upstream attempts exhausted" } })),
     )
         .into_response()
+}
+
+/// Builds a response that mirrors upstream status and end-to-end headers.
+fn build_response(status: StatusCode, headers: &HeaderMap, body: Body) -> Response {
+    let mut builder = Response::builder().status(status);
+    for (k, v) in headers {
+        if !is_hop_by_hop(k) {
+            builder = builder.header(k, v);
+        }
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Wraps a response byte stream so an [`InflightGuard`] is held for exactly as
+/// long as the stream is alive. Dropping the body (client disconnect, timeout,
+/// panic) releases the guard too, so the counter cannot leak.
+struct StreamGuard<S> {
+    _guard: crate::warp::InflightGuard,
+    inner: S,
+}
+
+impl<S> StreamGuard<S> {
+    fn new(guard: crate::warp::InflightGuard, inner: S) -> Self {
+        Self {
+            _guard: guard,
+            inner,
+        }
+    }
+}
+
+impl<S> futures_core::Stream for StreamGuard<S>
+where
+    S: futures_core::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
 }

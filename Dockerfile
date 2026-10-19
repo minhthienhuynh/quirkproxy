@@ -21,8 +21,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
-RUN cargo build --release && \
-    strip target/release/quirkproxy 2>/dev/null || true
+# Release profile already sets strip = true and panic = abort (see Cargo.toml).
+RUN cargo build --release
 
 # ==============================================================================
 # Stage 2: Minimal Runtime with Cloudflare WARP and opencode2api Core Engine

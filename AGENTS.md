@@ -21,6 +21,17 @@ QuirkProxy is a Rust-based supervisor and reverse proxy wrapping `opencode2api` 
    - Runs in `mode proxy` listening on loopback port `40000`.
    - Never modifies host network interfaces or routing tables.
 
+4. **Refusal gate (`src/gate.rs`)**:
+   - classifies upstream `403` bodies into quota / abuse / shape / geo / auth / version.
+   - only `quota`, `abuse` and `unknown` are rotation-eligible; the rest would
+     fail identically on a new egress and are returned to the client as-is.
+
+5. **In-flight guard (`src/warp.rs`)**:
+   - each streamed response holds an RAII guard until its final byte.
+   - operator-triggered rotations wait up to 30s for the tunnel to drain;
+     request-triggered rotations skip the wait, because the triggering request
+     has already failed.
+
 ## Commands
 
 - `make build` — Build Docker image `quirkproxy:v1`.

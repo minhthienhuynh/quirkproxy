@@ -725,12 +725,13 @@ dependencies = [
 
 [[package]]
 name = "quirkproxy"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "bytes",
  "fastrand",
+ "futures-core",
  "http-body-util",
  "reqwest",
  "serde",
