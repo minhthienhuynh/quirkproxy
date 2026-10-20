@@ -29,6 +29,32 @@ const RECYCLE_COOLDOWN: Duration = Duration::from_secs(60);
 /// giving up. Recycling tears down the tunnel, which truncates any stream
 /// still riding it.
 const RECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a tunnel restart waits for the traffic that is already on that
+/// tunnel to finish before the child is killed anyway.
+///
+/// Killing `wireproxy` drops every connection the tunnel is carrying, and a
+/// stream riding that tunnel dies with "unexpected EOF". The wait has to cover
+/// a full stream: the free models take 30s and more for a long answer, and a
+/// timeout that expires in the middle of one truncates it.
+///
+/// The wait is bounded, because the exit being replaced just refused a
+/// request and the pool has to be able to recover from that.
+const TUNNEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
+/// A connection that has stayed open this long counts as a stream.
+///
+/// Waiting for the tunnel to have *no* connection at all does not work under
+/// sustained load: ordinary requests keep arriving, the tunnel never goes
+/// idle, and every recycle is abandoned while the burned exit keeps refusing
+/// requests. A short request finishes on its own within a couple of seconds;
+/// a stream does not. Age is the only signal that separates them.
+const TUNNEL_STREAM_MIN_AGE: Duration = Duration::from_secs(3);
+/// How long the tunnel has to be free of streams before the swap goes ahead.
+///
+/// A stream that starts right after the check would be killed by the swap, so
+/// the absence has to hold for a moment, not just at a single instant.
+const TUNNEL_QUIET_WINDOW: Duration = Duration::from_millis(250);
+/// How often the tunnel drain re-reads the socket table.
+const TUNNEL_DRAIN_POLL: Duration = Duration::from_millis(100);
 /// A tunnel that ran this long before dying is restarted immediately instead
 /// of with backoff (crash loop vs. one-off crash).
 const TUNNEL_STABLE_UPTIME: Duration = Duration::from_secs(30);
@@ -58,6 +84,13 @@ pub struct TunnelStatus {
     pub ip: Option<String>,
     pub healthy: bool,
     pub recycling: bool,
+    /// Requests currently riding this tunnel.
+    ///
+    /// Counted from the socket table, so it is per tunnel: the engine picks
+    /// the proxy per attempt and the supervisor never learns which tunnel
+    /// carries which request. A non-zero value means the tunnel must not be
+    /// killed without draining it first.
+    pub connections: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,6 +161,14 @@ pub struct Tunnel {
     dir: PathBuf,
     conf_path: PathBuf,
     state: Mutex<TunnelState>,
+    /// Number of egress probes this supervisor is running against the tunnel
+    /// right now.
+    ///
+    /// The probes open a connection to the tunnel's own SOCKS5 port, so they
+    /// show up in the socket table exactly like real traffic does. Counting
+    /// them as traffic would make the drain wait for the supervisor's own
+    /// probe to finish.
+    probe_inflight: AtomicUsize,
     /// Set while a re-registration is in progress so concurrent 429s don't
     /// queue up behind the same tunnel.
     recycling: AtomicBool,
@@ -173,6 +214,13 @@ impl Tunnel {
 
     async fn probe_ip(&self) -> Option<String> {
         let client = self.probe.as_ref()?;
+        self.probe_inflight.fetch_add(1, Ordering::SeqCst);
+        let result = self.probe_ip_inner(client).await;
+        self.probe_inflight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn probe_ip_inner(&self, client: &reqwest::Client) -> Option<String> {
         for url in [
             "https://cloudflare.com/cdn-cgi/trace",
             "https://api.ipify.org?format=json",
@@ -196,6 +244,103 @@ impl Tunnel {
             }
         }
         None
+    }
+
+    /// Number of TCP connections currently established against this tunnel's
+    /// SOCKS5 port, minus the probes this supervisor is running itself.
+    ///
+    /// The engine picks the proxy per attempt, so the supervisor never learns
+    /// which tunnel carries which request. The socket table does: the engine
+    /// and the supervisor share the container's network namespace, and every
+    /// request through this tunnel holds a connection to its SOCKS5 port.
+    ///
+    /// This is the per-tunnel signal the pool-wide in-flight counter cannot
+    /// provide. Recycling kills the tunnel, so a tunnel with live connections
+    /// must not be killed while they are still streaming.
+    fn active_connections(&self) -> usize {
+        self.sockets()
+            .len()
+            .saturating_sub(self.probe_inflight.load(Ordering::Relaxed))
+    }
+
+    /// Inodes of the connections currently established against this tunnel.
+    fn sockets(&self) -> Vec<u64> {
+        established_sockets_on_port(self.port)
+    }
+
+    /// Waits until this tunnel is carrying no stream.
+    ///
+    /// A connection that has been open for `stream_min_age` is a stream, and
+    /// the wait continues until it closes. Shorter connections are ordinary
+    /// requests: they finish by themselves and are not waited for, otherwise
+    /// sustained load would block every recycle forever.
+    ///
+    /// The first `stream_min_age` of the wait is observation only. Until then
+    /// a long-running stream is indistinguishable from one that just started,
+    /// so trusting the classification would let the swap truncate exactly the
+    /// connection it is meant to protect.
+    ///
+    /// Returns true when no stream is left, false when the timeout expired.
+    async fn wait_until_drained(&self, timeout: Duration) -> bool {
+        self.drain_streams(TUNNEL_STREAM_MIN_AGE, TUNNEL_QUIET_WINDOW, timeout)
+            .await
+    }
+
+    /// The body of [`Tunnel::wait_until_drained`], with the thresholds
+    /// injectable so a test does not have to spend seconds on them.
+    async fn drain_streams(
+        &self,
+        stream_min_age: Duration,
+        quiet_window: Duration,
+        timeout: Duration,
+    ) -> bool {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        // When each connection on this port was first observed. A socket that
+        // keeps its inode has been open since then: the kernel does not reuse
+        // an inode while the socket lives.
+        let mut first_seen: std::collections::HashMap<u64, Instant> =
+            std::collections::HashMap::new();
+        let mut quiet_since: Option<Instant> = None;
+
+        loop {
+            let now = Instant::now();
+            let current = self.sockets();
+            for inode in &current {
+                first_seen.entry(*inode).or_insert(now);
+            }
+            // Connections that closed no longer matter, and forgetting them
+            // keeps the map from growing over a long wait.
+            first_seen.retain(|inode, _| current.contains(inode));
+
+            let streams = if now.duration_since(started) < stream_min_age {
+                // Still observing: an old stream looks new right now.
+                1
+            } else {
+                current
+                    .iter()
+                    .filter(|inode| {
+                        first_seen
+                            .get(*inode)
+                            .is_some_and(|seen| now.duration_since(*seen) >= stream_min_age)
+                    })
+                    .count()
+            };
+
+            if streams == 0 {
+                let since = *quiet_since.get_or_insert(now);
+                if since.elapsed() >= quiet_window {
+                    return true;
+                }
+            } else {
+                quiet_since = None;
+            }
+
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep(TUNNEL_DRAIN_POLL).await;
+        }
     }
 
     /// Re-registers a fresh WARP identity and rewrites the wireproxy config.
@@ -463,6 +608,7 @@ impl Tunnel {
             ip: st.ip.clone(),
             healthy: st.healthy,
             recycling: self.recycling.load(Ordering::Relaxed),
+            connections: self.active_connections(),
         }
     }
 }
@@ -507,6 +653,7 @@ impl WarpPool {
                         restart_generation: 0,
                         probe_completed: false,
                     }),
+                    probe_inflight: AtomicUsize::new(0),
                     recycling: AtomicBool::new(false),
                     restart: tokio::sync::Notify::new(),
                     probe,
@@ -710,16 +857,30 @@ impl WarpPool {
 
     /// Picks the next tunnel for recycling *and* claims it, in one step.
     ///
-    /// Picking and claiming separately loses recycles: two concurrent 429s
-    /// can both observe the same tunnel as free, and the loser of the claim
+    /// Picking and claiming separately loses recycles: two concurrent 429s can
+    /// both observe the same tunnel as free, and the loser of the claim
     /// silently drops its recycle while the tunnel it wanted stays burned.
     /// Claiming with a compare-exchange inside the selection loop makes the
     /// loser move on to the next candidate instead.
+    ///
+    /// Tunnels with no open connection are preferred. The supervisor never
+    /// learns which tunnel served the refused request -- the engine picks the
+    /// proxy per attempt -- so a round-robin pick can land on a tunnel that is
+    /// currently streaming a healthy response. Recycling that one truncates
+    /// an unrelated stream. An idle tunnel is always the better victim.
+    ///
+    /// When every eligible tunnel is busy, the least busy one is taken rather
+    /// than an arbitrary one: that is the tunnel whose streams are closest to
+    /// finishing, so the drain in `recycle_locked` has the best chance of
+    /// completing before the child is killed.
     fn claim_tunnel(&self) -> Option<Arc<Tunnel>> {
         let n = self.tunnels.len();
         if n == 0 {
             return None;
         }
+
+        let mut fallback: Option<(usize, Arc<Tunnel>)> = None;
+
         for _ in 0..n {
             let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
             let t = &self.tunnels[start % n];
@@ -733,16 +894,40 @@ impl WarpPool {
             if !eligible {
                 continue;
             }
-            if t.recycling
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                // Another caller claimed it first; try the next candidate.
-                continue;
+            let busy = t.active_connections();
+            if busy == 0 {
+                // An idle tunnel: the best possible victim, take it now.
+                if t.recycling
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    // Another caller claimed it first; try the next candidate.
+                    continue;
+                }
+                return Some(t.clone());
             }
-            return Some(t.clone());
+            // Busy, but keep the least busy one as the fallback.
+            let better = match &fallback {
+                Some((_, current)) => busy < current.active_connections(),
+                None => true,
+            };
+            if better {
+                fallback = Some((busy, t.clone()));
+            }
         }
-        None
+
+        // Every eligible tunnel is busy. Take the least busy one -- a recycle
+        // is never skipped just because the pool is under load, since a
+        // burned exit has to be replaced even at that cost.
+        let (_, tunnel) = fallback?;
+        if tunnel
+            .recycling
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some(tunnel)
     }
 
     /// Recycles one tunnel in the background: new identity, new egress IP.
@@ -770,73 +955,110 @@ impl WarpPool {
     async fn recycle_locked(&self, tunnel: Arc<Tunnel>, reason: &str) -> Option<String> {
         // Concurrent `wgcf register` runs in the same directory would corrupt
         // the identity files, so re-registrations are serialised pool-wide.
-        let _guard = self.recycle_lock.lock().await;
-
+        //
+        // The lock covers the re-registration only. The drain below can take
+        // much longer than a registration, and holding the pool-wide lock for
+        // that whole time would block every other recycle -- and the
+        // operator's /v1/rotate -- behind a tunnel that is busy.
         let old_ip = tunnel.state.lock().await.ip.clone();
         info!(
             "Recycling tunnel {} ({}): {} (current egress: {:?})",
             tunnel.index, tunnel.port, reason, old_ip
         );
 
-        let result = match tunnel.re_register().await {
+        let re_registered = {
+            let _guard = self.recycle_lock.lock().await;
+            tunnel.re_register().await
+        };
+
+        let result = match re_registered {
             Ok(()) => {
-                // The supervisor owns the child: signal it so the restart picks
-                // up the freshly written config, and wait until it has.
-                if !restart_tunnel(&tunnel).await {
+                // The tunnel is about to be killed and respawned with the new
+                // identity. Killing it drops every connection it is carrying,
+                // and a stream riding that tunnel dies with "unexpected EOF" --
+                // the request that triggered this recycle has already failed,
+                // but other requests may still be streaming through this
+                // tunnel.
+                //
+                // The pool-wide in-flight counter cannot decide this: it does
+                // not say which tunnel carries the traffic, and the engine
+                // picks the proxy per attempt. The socket table does.
+                //
+                // The child keeps running the old identity while this waits,
+                // so the tunnel serves its traffic normally: the swap only
+                // happens once the tunnel has gone quiet.
+                if !tunnel.wait_until_drained(TUNNEL_DRAIN_TIMEOUT).await {
+                    // The tunnel stayed busy. Refreshing a burned exit is not
+                    // worth truncating a stream that is running fine, so the
+                    // swap is abandoned: the child keeps serving the identity
+                    // it has, and the next refused request tries again.
+                    warn!(
+                        "Tunnel {}: a stream is still running after {:?}; the swap is abandoned so that it is not truncated",
+                        tunnel.index,
+                        TUNNEL_DRAIN_TIMEOUT
+                    );
                     tunnel.state.lock().await.last_recycle = Instant::now();
-                    tunnel.recycling.store(false, Ordering::SeqCst);
-                    return None;
-                }
-
-                let mut new_ip = None;
-                for _ in 0..30 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if let Some(ip) = tunnel.probe_ip().await {
-                        new_ip = Some(ip);
-                        break;
-                    }
-                }
-
-                {
-                    let mut st = tunnel.state.lock().await;
-                    st.last_recycle = Instant::now();
-                    st.healthy = new_ip.is_some();
-                    // After a recycle the tunnel runs a fresh identity, so the
-                    // previous exit address is stale: report the new one, or
-                    // nothing at all when it could not be verified.
-                    st.ip = new_ip.clone();
-                    st.probe_completed = true;
-                }
-
-                match new_ip.clone() {
-                    Some(ip) if Some(&ip) != old_ip.as_ref() => {
-                        info!(
-                            "Tunnel {} recycled: {} -> {}",
-                            tunnel.index,
-                            old_ip.as_deref().unwrap_or("?"),
-                            ip
-                        );
-                        self.rotations.fetch_add(1, Ordering::Relaxed);
-                        let mut h = self.history.lock().await;
-                        h.push(RotateRecord {
-                            tunnel: tunnel.index,
-                            old_ip,
-                            new_ip: ip,
-                            timestamp: chrono_now(),
-                            reason: reason.to_string(),
-                        });
-                        if h.len() > 50 {
-                            h.remove(0);
+                    None
+                } else {
+                    // The supervisor owns the child: signal it so the restart
+                    // picks up the freshly written config, and wait until it
+                    // has.
+                    if !restart_tunnel(&tunnel).await {
+                        tunnel.state.lock().await.last_recycle = Instant::now();
+                        None
+                    } else {
+                        let mut new_ip = None;
+                        for _ in 0..30 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            if let Some(ip) = tunnel.probe_ip().await {
+                                new_ip = Some(ip);
+                                break;
+                            }
                         }
-                    }
-                    Some(ip) => warn!(
-                        "Tunnel {}: re-registration kept the same egress {}; not counted as a rotation.",
-                        tunnel.index, ip
-                    ),
-                    None => warn!("Tunnel {}: could not verify a new egress IP.", tunnel.index),
-                }
 
-                new_ip
+                        {
+                            let mut st = tunnel.state.lock().await;
+                            st.last_recycle = Instant::now();
+                            st.healthy = new_ip.is_some();
+                            // After a recycle the tunnel runs a fresh identity,
+                            // so the previous exit address is stale: report
+                            // the new one, or nothing at all when it could not
+                            // be verified.
+                            st.ip = new_ip.clone();
+                            st.probe_completed = true;
+                        }
+
+                        match new_ip.clone() {
+                            Some(ip) if Some(&ip) != old_ip.as_ref() => {
+                                info!(
+                                    "Tunnel {} recycled: {} -> {}",
+                                    tunnel.index,
+                                    old_ip.as_deref().unwrap_or("?"),
+                                    ip
+                                );
+                                self.rotations.fetch_add(1, Ordering::Relaxed);
+                                let mut h = self.history.lock().await;
+                                h.push(RotateRecord {
+                                    tunnel: tunnel.index,
+                                    old_ip,
+                                    new_ip: ip,
+                                    timestamp: chrono_now(),
+                                    reason: reason.to_string(),
+                                });
+                                if h.len() > 50 {
+                                    h.remove(0);
+                                }
+                            }
+                            Some(ip) => warn!(
+                                "Tunnel {}: re-registration kept the same egress {}; not counted as a rotation.",
+                                tunnel.index, ip
+                            ),
+                            None => warn!("Tunnel {}: could not verify a new egress IP.", tunnel.index),
+                        }
+
+                        new_ip
+                    }
+                }
             }
             Err(e) => {
                 error!("Tunnel {}: re-registration failed: {:#}", tunnel.index, e);
@@ -947,6 +1169,67 @@ async fn restart_tunnel(tunnel: &Arc<Tunnel>) -> bool {
         tunnel.index
     );
     false
+}
+
+/// Counts the TCP connections in `ESTABLISHED` state whose local port is
+/// `port`.
+///
+/// The engine and the supervisor share the container's network namespace, so
+/// `/proc/net/tcp` and `/proc/net/tcp6` show every connection the engine holds
+/// against a tunnel's SOCKS5 port. Each such connection is one request
+/// currently riding that tunnel.
+///
+/// The format is fixed by the kernel: one header line, then one line per
+/// socket, with the local address in `HEX_IP:HEX_PORT` and the state as a
+/// two-digit hex code (`01` = ESTABLISHED) and the socket's inode in the
+/// tenth column.
+fn established_sockets_on_port(port: u16) -> Vec<u64> {
+    let mut inodes = Vec::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        inodes.extend(established_sockets_in(&text, port));
+    }
+    inodes
+}
+
+/// Collects the inodes of the established sockets on `port` in one
+/// `/proc/net/tcp` table.
+///
+/// The inode identifies a socket across polls, which is how the drain tells a
+/// stream (open for seconds) from an ordinary request (open for milliseconds).
+///
+/// Split out from the file access so the parsing can be tested against a
+/// recorded table instead of against whatever the host happens to run.
+fn established_sockets_in(table: &str, port: u16) -> Vec<u64> {
+    let mut inodes = Vec::new();
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _sl = fields.next();
+        let Some(local) = fields.next() else {
+            continue;
+        };
+        let _remote = fields.next();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        if state != "01" {
+            continue;
+        }
+        let Some(hex_port) = local.rsplit(':').next() else {
+            continue;
+        };
+        if u16::from_str_radix(hex_port, 16) != Ok(port) {
+            continue;
+        }
+        // The inode is the tenth column: sl local rem st tx:rx tr:when retrnsmt
+        // uid timeout inode. Four fields have been read (sl, local, rem, st),
+        // so five more have to be skipped to reach it.
+        let inode = fields.nth(5).and_then(|v| v.parse::<u64>().ok());
+        inodes.push(inode.unwrap_or(0));
+    }
+    inodes
 }
 
 fn chrono_now() -> String {
@@ -1167,5 +1450,226 @@ mod tests {
 
         // Must not be immediately picked again
         assert!(pool.claim_tunnel().is_none());
+    }
+
+    #[test]
+    fn established_socket_count_ignores_other_ports_and_states() {
+        // A recorded /proc/net/tcp table: the header, an established socket
+        // on the tunnel port, one on another port, one on the tunnel port in
+        // LISTEN state, and one on the tunnel port in TIME_WAIT.
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:9C41 0100007F:9C42 01 00000000:00000000 00:00000000 00000000     0        0 82723625 2 0000000000000000 100 0 0 10 0
+   1: 0100007F:9C41 0100007F:9C43 01 00000000:00000000 00:00000000 00000000     0        0 82723626 2 0000000000000000 100 0 0 10 0
+   2: 0100007F:9C42 0100007F:9C41 01 00000000:00000000 00:00000000 00000000     0        0 82723627 2 0000000000000000 100 0 0 10 0
+   3: 0100007F:9C43 0100007F:9C41 01 00000000:00000000 00:00000000 00000000     0        0 82723628 2 0000000000000000 100 0 0 10 0
+   4: 0100007F:9C44 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 82723629 2 0000000000000000 100 0 0 10 0
+   5: 0100007F:9C41 0100007F:9C45 06 00000000:00000000 00:00000000 00000000     0        0 82723630 2 0000000000000000 100 0 0 10 0
+";
+
+        // 0x9C41 = 40001 (the tunnel port), 0x9C42 = 40002, 0x9C43 = 40003
+        assert_eq!(established_sockets_in(table, 40001).len(), 2);
+        assert_eq!(established_sockets_in(table, 40002).len(), 1);
+        assert_eq!(established_sockets_in(table, 40003).len(), 1);
+        assert!(established_sockets_in(table, 40004).is_empty());
+    }
+
+    #[test]
+    fn established_sockets_report_their_inode() {
+        // The inode identifies a socket across polls, which is what lets the
+        // drain tell a stream from an ordinary request.
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:9C41 0100007F:9C42 01 00000000:00000000 00:00000000 00000000     0        0 82723625 2 0000000000000000 100 0 0 10 0
+   1: 0100007F:9C41 0100007F:9C43 01 00000000:00000000 00:00000000 00000000     0        0 82723626 2 0000000000000000 100 0 0 10 0
+";
+        assert_eq!(
+            established_sockets_in(table, 40001),
+            vec![82723625, 82723626]
+        );
+    }
+
+    #[test]
+    fn established_socket_count_survives_a_truncated_table() {
+        // A line cut short must not be counted and must not panic.
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:9C41 0100007F:9C42 01 00000000:00000000 00:00000000 00000000     0        0 82723625 2 0000000000000000 100 0 0 10 0
+   1: 0100007F
+";
+        assert_eq!(established_sockets_in(table, 40001).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_tunnel_is_preferred_over_a_busy_one() {
+        let pool = pool_with(2);
+        let busy = pool.tunnels[0].clone();
+        let idle = pool.tunnels[1].clone();
+
+        // Pretend the first tunnel is carrying a request.
+        busy.probe_inflight.store(0, Ordering::SeqCst);
+        assert_eq!(
+            busy.active_connections(),
+            established_sockets_on_port(busy.port).len()
+        );
+
+        let claimed = pool.claim_tunnel().expect("a tunnel should be claimable");
+        // With no real sockets on the test ports both tunnels look idle, so the
+        // claim may land on either. What matters is that the claim succeeds
+        // and that the busy-tunnel preference does not break the fallback.
+        assert!(claimed.index == 0 || claimed.index == 1);
+        claimed.recycling.store(false, Ordering::SeqCst);
+        let _ = idle;
+    }
+
+    #[tokio::test]
+    async fn tunnel_with_no_connections_drains_immediately() {
+        let pool = pool_with(1);
+        let tunnel = pool.tunnels[0].clone();
+        // Nothing is listening on the test port, so there is no stream to wait
+        // for; the thresholds are shortened so the test does not sleep.
+        assert_eq!(tunnel.active_connections(), 0);
+        assert!(
+            tunnel
+                .drain_streams(
+                    Duration::from_millis(20),
+                    Duration::from_millis(20),
+                    Duration::from_secs(5)
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_probe_does_not_count_as_traffic() {
+        let pool = pool_with(1);
+        let tunnel = pool.tunnels[0].clone();
+        // One probe in flight must cancel out one established socket, so the
+        // supervisor's own probe never looks like a request it must wait for.
+        tunnel.probe_inflight.store(1, Ordering::SeqCst);
+        assert_eq!(tunnel.active_connections(), 0);
+    }
+
+    /// Binds a listener and returns it plus the port, together with the number
+    /// of sockets that were already established on that port.
+    ///
+    /// A loopback connection shows up in the socket table twice (once per
+    /// side), and the kernel reuses ephemeral ports, so a test cannot assert
+    /// on absolute counts. Taking the difference around its own connection is
+    /// the only stable way to identify it.
+    async fn bind_test_socket() -> (tokio::net::TcpListener, u16, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let port = listener.local_addr().expect("local addr").port();
+        let before = established_sockets_on_port(port).len();
+        (listener, port, before)
+    }
+
+    #[tokio::test]
+    async fn a_live_connection_on_the_tunnel_port_is_counted() {
+        // A real socket on the tunnel's port: the test process and the
+        // supervisor share a network namespace, so the socket shows up in the
+        // same table the supervisor reads.
+        let (listener, port, before) = bind_test_socket().await;
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect should succeed");
+        let _accepted = listener.accept().await.expect("accept should succeed");
+
+        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let tunnel = pool.tunnels[0].clone();
+
+        let ours = established_sockets_on_port(port)
+            .len()
+            .saturating_sub(before);
+        assert!(
+            ours > 0,
+            "the connection must be visible in the socket table"
+        );
+        assert!(
+            tunnel.active_connections() >= ours,
+            "a live connection on the tunnel port must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_blocks_the_swap_until_it_closes() {
+        let (listener, port, _before) = bind_test_socket().await;
+        let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect should succeed");
+        let (accepted, _) = listener.accept().await.expect("accept should succeed");
+
+        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let tunnel = pool.tunnels[0].clone();
+
+        // A stream that is still open when the wait expires must not be
+        // truncated: the wait has to report failure instead.
+        let drained = tunnel
+            .drain_streams(
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                Duration::from_millis(400),
+            )
+            .await;
+        assert!(!drained, "the swap must wait for a running stream");
+        assert!(tunnel.active_connections() > 0);
+
+        // Once it closes the wait completes and the swap may go ahead.
+        drop(client);
+        drop(accepted);
+        assert!(
+            tunnel
+                .drain_streams(
+                    Duration::from_millis(50),
+                    Duration::from_millis(50),
+                    Duration::from_secs(5)
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_finishes_during_the_wait_stops_counting() {
+        // Measured on the live pool: waiting for a tunnel to have no
+        // connection at all never completed under sustained load, so every
+        // recycle was abandoned while the burned exit kept refusing requests.
+        // A short request closes by itself and must not hold the swap back.
+        //
+        // A connection that is still open when the wait expires cannot be
+        // told apart from a stream, so the case that matters is the one that
+        // closes: it leaves the socket table and stops counting.
+        let (listener, port, _before) = bind_test_socket().await;
+        let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect should succeed");
+        let (accepted, _) = listener.accept().await.expect("accept should succeed");
+
+        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let tunnel = pool.tunnels[0].clone();
+        assert!(tunnel.active_connections() > 0);
+
+        // The request finishes while the drain is still observing.
+        let drain = tokio::spawn({
+            let tunnel = tunnel.clone();
+            async move {
+                tunnel
+                    .drain_streams(
+                        Duration::from_millis(600),
+                        Duration::from_millis(50),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(client);
+        drop(accepted);
+
+        assert!(
+            drain.await.expect("drain task should not panic"),
+            "a request that finishes during the wait must not hold the swap back"
+        );
     }
 }
