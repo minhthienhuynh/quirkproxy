@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::gate::{classify_403, RefusalKind};
-use crate::warp::WarpManager;
+use crate::warp::WarpPool;
 
 /// Max buffered request body (32 MiB). The body must be buffered to allow
 /// replaying it after a WARP IP rotation.
@@ -23,7 +23,7 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
-    pub warp: Arc<WarpManager>,
+    pub warp: Arc<WarpPool>,
     pub http_client: reqwest::Client,
 }
 
@@ -87,7 +87,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "status": overall,
             "service": "QuirkProxy",
-            "version": "1.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "engine": "opencode2api",
             "engine_online": engine.reachable,
             "engine_ready": engine.ready,
@@ -108,7 +108,7 @@ pub async fn trigger_rotate(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !state.config.warp_enabled {
+    if !state.warp.enabled() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -138,7 +138,7 @@ pub async fn trigger_rotate(
 
     match state
         .warp
-        .rotate("Manual API Trigger (/v1/rotate)", true)
+        .rotate_all("Manual API Trigger (/v1/rotate)")
         .await
     {
         Ok(new_ip) => (
@@ -228,7 +228,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         }
     };
 
-    let max_retries = if state.config.warp_enabled
+    let max_retries = if state.warp.enabled()
         && (state.config.warp_auto_rotate_429 || state.config.warp_auto_rotate_403)
     {
         state.config.max_retries.max(1)
@@ -311,48 +311,40 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 }
             }
 
-            if should_rotate && state.config.warp_enabled && attempt < max_retries {
+            if should_rotate && state.warp.enabled() {
                 let err_kind = if is_429 {
                     RefusalKind::Quota
                 } else {
                     refusal.unwrap_or(RefusalKind::Unknown)
                 };
-                let err_old_ip = state.warp.status().await.current_ip;
+                let status_before = state.warp.status().await;
+
                 warn!(
-                    "Upstream returned {} ({}) - triggering WARP IP rotation (attempt {}/{})...",
+                    "Upstream returned {} ({}) - refreshing the WARP pool (attempt {}/{})...",
                     status,
                     err_kind.as_str(),
                     attempt,
                     max_retries
                 );
 
-                // This request already failed, so its own stream is gone; do not
-                // wait for the tunnel to drain, or every retry would inherit the
-                // latency of other clients' streams.
-                if let Ok(Some(new_ip)) = state
-                    .warp
-                    .rotate(
-                        &format!(
-                            "Upstream {} ({}) on attempt {}",
-                            status,
-                            err_kind.as_str(),
-                            attempt
-                        ),
-                        false,
-                    )
-                    .await
-                {
-                    // rotate() also returns the old IP when throttled, when the
-                    // tunnel refused to drain, or when 4 registrations all drew
-                    // the same address. Retrying on an unchanged identity only
-                    // burns the remaining attempts on a known-bad egress.
-                    if Some(&new_ip) == err_old_ip.as_ref() {
-                        warn!("WARP identity unchanged; not retrying on the same IP.");
-                    } else {
-                        info!("WARP rotated to new IP: {} - Retrying request...", new_ip);
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        continue;
-                    }
+                // Never block the request path on a registration. The recycle
+                // refreshes one identity in the background; the retry below
+                // lands on whichever tunnel the engine has not burned yet.
+                state.warp.recycle_async(&format!(
+                    "Upstream {} ({}) on attempt {}",
+                    status,
+                    err_kind.as_str(),
+                    attempt
+                ));
+
+                if attempt < max_retries {
+                    info!(
+                        "Retrying on a different tunnel (healthy before retry: {}/{})...",
+                        status_before.tunnels.iter().filter(|t| t.healthy).count(),
+                        status_before.tunnels.len()
+                    );
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
                 }
             }
 
@@ -364,7 +356,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         // Copy end-to-end headers before `res` is consumed by bytes_stream().
         let res_headers = res.headers().clone();
 
-        // The guard is moved into the body stream so the tunnel counts as busy
+        // The guard is moved into the body stream so the pool counts as busy
         // until the last byte reaches the client, not just until headers arrive.
         let guard = state.warp.begin_request();
         let stream = res.bytes_stream();

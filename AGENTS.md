@@ -4,22 +4,24 @@ Instructions for AI agents working in this repository.
 
 ## Architecture
 
-QuirkProxy is a Rust-based supervisor and reverse proxy wrapping `opencode2api` (core engine) and Cloudflare WARP (SOCKS5 egress):
+QuirkProxy is a Rust supervisor and reverse proxy wrapping `opencode2api` (core engine) and a userspace Cloudflare WARP egress pool:
 
 1. **Rust Supervisor (`src/`)**:
-   - Manages child process lifecycles: `warp-svc` and `opencode2api`.
+   - Manages child process lifecycles: N `wireproxy` tunnels and `opencode2api`.
    - Listens on `:8080` (Axum + Tokio + Reqwest) and proxies all incoming traffic to `opencode2api` on `:18088`.
-   - When `opencode2api` returns `HTTP 429` (Rate Limit) or `HTTP 403` (Abuse / FreeTierError), the supervisor invokes `warp-cli registration new` to draw a fresh Cloudflare egress IP, and retries the request transparently.
-   - Handles graceful SIGTERM / SIGINT shutdown, ensuring all child processes are killed properly.
+   - When `opencode2api` returns `HTTP 429` (Rate Limit) or a rotation-eligible `HTTP 403`, the supervisor recycles one tunnel in the background and retries the request, which lands on a different exit.
+   - Handles graceful SIGTERM / SIGINT shutdown, keeping every child process reaped.
 
 2. **Core Engine (`opencode2api`)**:
    - Unmodified official Go binary from `jasonxu114514/opencode2api`.
    - Handles 100% of OpenCode protocol translation, Bun uTLS fingerprinting, session IDs, and tool calling schemas.
-   - Configured with `"proxies": ["socks5://127.0.0.1:40000#pool"]` so it never penalizes proxies with failure cooldowns and draws fresh TCP/CONNECT tunnels per request.
+   - Configured with one `"socks5://127.0.0.1:<port>#pool"` entry per tunnel. The engine builds one anonymous node per proxy and cycles `#pool` transports across retry attempts, so a burned exit is skipped instead of retried.
 
-3. **Cloudflare WARP Client (`warp-svc`)**:
-   - Runs in `mode proxy` listening on loopback port `40000`.
-   - Never modifies host network interfaces or routing tables.
+3. **WARP tunnels (`wgcf` + `wireproxy`)**:
+   - Each identity is a separate WARP registration; `wireproxy` speaks WireGuard in userspace and exposes SOCKS5 on loopback.
+   - No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no host route changes.
+   - `wgcf register` refuses to overwrite an existing account, so `re_register()` deletes `wgcf-account.toml` / `wgcf-profile.conf` first.
+   - Profiles live in `WARP_STATE_DIR` (a volume). Losing the volume means new identities and new egress IPs on next boot.
 
 4. **Refusal gate (`src/gate.rs`)**:
    - classifies upstream `403` bodies into quota / abuse / shape / geo / auth / version.
@@ -28,13 +30,19 @@ QuirkProxy is a Rust-based supervisor and reverse proxy wrapping `opencode2api` 
 
 5. **In-flight guard (`src/warp.rs`)**:
    - each streamed response holds an RAII guard until its final byte.
-   - operator-triggered rotations wait up to 30s for the tunnel to drain;
-     request-triggered rotations skip the wait, because the triggering request
+   - operator-triggered rotations wait up to 30s for the pool to drain;
+     request-triggered recycles skip the wait, because the triggering request
      has already failed.
+
+6. **Startup ordering matters**:
+   - `WarpPool::start()` blocks until at least one tunnel answers an egress
+     probe (max 30s) before the engine is spawned. The engine fetches its model
+     catalog once at startup; if it runs while every SOCKS5 port is still
+     closed, the catalog stays empty until the next refresh window.
 
 ## Commands
 
-- `make build` — Build Docker image `quirkproxy:v1`.
+- `make build` — Build Docker image `quirkproxy:v1.2`.
 - `make run` — Run stack with docker compose.
 - `make test` — Test endpoint `/healthz`.
 - `make clean` — Stop and remove containers.

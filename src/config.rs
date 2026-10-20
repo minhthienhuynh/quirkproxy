@@ -29,14 +29,20 @@ pub struct Config {
     pub opencode_api_port: u16,
     /// Upstream API base URL (default: http://127.0.0.1:18088)
     pub upstream_api: String,
-    /// Internal SOCKS5 port for Cloudflare WARP in proxy mode (default: 40000)
-    pub warp_socks_port: u16,
-    /// Whether Cloudflare WARP is enabled (default: true)
+    /// First SOCKS5 port of the WARP tunnel pool (default: 40001).
+    /// Tunnel `i` (0-based) listens on `warp_base_socks_port + i`.
+    pub warp_base_socks_port: u16,
+    /// Number of independent WARP identities/tunnels to run (default: 3).
+    /// Set to 0 to disable WARP entirely.
+    pub warp_identities: usize,
+    /// Whether Cloudflare WARP tunnels are enabled (default: true)
     pub warp_enabled: bool,
-    /// Auto-rotate WARP IP when receiving HTTP 429 Rate Limit (default: true)
+    /// Auto-rotate a WARP identity when receiving HTTP 429 Rate Limit (default: true)
     pub warp_auto_rotate_429: bool,
-    /// Auto-rotate WARP IP when receiving HTTP 403 Abuse / FreeTierError (default: true)
+    /// Auto-rotate a WARP identity when receiving HTTP 403 Abuse / FreeTierError (default: true)
     pub warp_auto_rotate_403: bool,
+    /// Directory holding per-identity WireGuard profiles (default: /app/warp)
+    pub warp_state_dir: String,
     /// Max retry attempts after IP rotation (default: 3)
     pub max_retries: usize,
     /// Binary path for opencode2api
@@ -63,15 +69,21 @@ impl Config {
         let upstream_api = env::var("UPSTREAM_API")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", opencode_api_port));
 
+        // WARP_IDENTITIES=0 is a deliberate "no tunnels" switch, so it must not
+        // fall back to the default the way a missing variable would.
+        let warp_identities = env_parse::<usize>("WARP_IDENTITIES", 3);
+
         Self {
             host,
             port,
             opencode_api_port,
             upstream_api,
-            warp_socks_port: env_parse("WARP_SOCKS_PORT", 40000),
-            warp_enabled: env_bool("WARP_ENABLED", true),
+            warp_base_socks_port: env_parse("WARP_BASE_SOCKS_PORT", 40001),
+            warp_identities,
+            warp_enabled: env_bool("WARP_ENABLED", true) && warp_identities > 0,
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
+            warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
             max_retries: env_parse("MAX_RETRIES", 3).max(1),
             opencode2api_bin: env::var("OPENCODE2API_BIN")
                 .unwrap_or_else(|_| "/usr/local/bin/opencode2api".to_string()),
@@ -79,5 +91,59 @@ impl Config {
                 .unwrap_or_else(|_| "/app/config.json".to_string()),
             server_key: env::var("SERVER_KEY").unwrap_or_else(|_| "local-test-key".to_string()),
         }
+    }
+
+    /// SOCKS5 port for tunnel `index` (0-based).
+    pub fn tunnel_port(&self, index: usize) -> u16 {
+        self.warp_base_socks_port + index as u16
+    }
+
+    /// Every tunnel proxy URL, in the `#pool` form the engine understands.
+    pub fn proxy_urls(&self) -> Vec<String> {
+        (0..self.warp_identities)
+            .map(|i| format!("socks5://127.0.0.1:{}#pool", self.tunnel_port(i)))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_ports_are_contiguous() {
+        let cfg = Config {
+            host: "0.0.0.0".into(),
+            port: 8080,
+            opencode_api_port: 18088,
+            upstream_api: "http://127.0.0.1:18088".into(),
+            warp_base_socks_port: 40001,
+            warp_identities: 3,
+            warp_enabled: true,
+            warp_auto_rotate_429: true,
+            warp_auto_rotate_403: true,
+            warp_state_dir: "/app/warp".into(),
+            max_retries: 3,
+            opencode2api_bin: "opencode2api".into(),
+            opencode2api_config: "/app/config.json".into(),
+            server_key: "k".into(),
+        };
+        assert_eq!(cfg.tunnel_port(0), 40001);
+        assert_eq!(cfg.tunnel_port(2), 40003);
+        assert_eq!(
+            cfg.proxy_urls(),
+            vec![
+                "socks5://127.0.0.1:40001#pool",
+                "socks5://127.0.0.1:40002#pool",
+                "socks5://127.0.0.1:40003#pool",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_identities_means_no_proxies() {
+        let mut cfg = Config::from_env();
+        cfg.warp_identities = 0;
+        assert!(cfg.proxy_urls().is_empty());
     }
 }

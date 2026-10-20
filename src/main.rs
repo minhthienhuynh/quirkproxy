@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use config::Config;
 use proxy::AppState;
-use warp::WarpManager;
+use warp::WarpPool;
 
 /// How long to wait for the engine to answer /healthz after spawning it.
 /// The engine returns 503 until its model catalog refresh succeeds, which
@@ -49,9 +49,10 @@ fn ensure_opencode2api_config(config: &Config) -> Result<()> {
         "zen_keys": [],
         "go_keys": [],
         "anonymous": true,
-        "proxies": [
-            format!("socks5://127.0.0.1:{}#pool", config.warp_socks_port)
-        ],
+        // One entry per WARP identity. The engine's anonymous pool gives every
+        // proxy its own node, so a 429 on one exit retries on the next instead
+        // of re-registering and waiting.
+        "proxies": config.proxy_urls(),
         "proxyfile": "",
         "upstream": {
             "zen": "https://opencode.ai/zen",
@@ -165,21 +166,25 @@ async fn main() -> Result<()> {
     info!("=== Starting QuirkProxy (Rust Supervisor + OpenCode2API Core Engine) ===");
 
     let config = Config::from_env();
-    let warp = Arc::new(WarpManager::new(
-        config.warp_socks_port,
+    let tunnel_ports: Vec<u16> = (0..config.warp_identities)
+        .map(|i| config.tunnel_port(i))
+        .collect();
+
+    let warp = Arc::new(WarpPool::new(
+        tunnel_ports,
+        &config.warp_state_dir,
         config.warp_enabled,
     ));
 
-    // 1. Initialize Cloudflare WARP SOCKS5 client
-    if let Err(e) = warp.start().await {
-        error!("WARP startup encountered an issue: {}", e);
-    }
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // 1. Start the Cloudflare WARP tunnel pool (userspace, no NET_ADMIN)
+    let warp_tasks = warp.start(shutdown.clone()).await;
 
     // 2. Prepare opencode2api configuration
     ensure_opencode2api_config(&config)?;
 
     // 3. Spawn opencode2api core engine under supervision (restart on crash)
-    let shutdown = Arc::new(AtomicBool::new(false));
     let engine_task = {
         let cfg = config.clone();
         let shutdown = shutdown.clone();
@@ -260,10 +265,27 @@ async fn main() -> Result<()> {
 
     info!("Shutting down QuirkProxy...");
 
-    // Signal the supervisor to stop and reap the engine child process
+    // Signal all supervisors to stop and reap child processes
     shutdown.store(true, Ordering::Relaxed);
-    let _ = tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, engine_task).await;
-    info!("Supervisor stopped opencode2api child process.");
+
+    let shutdown_all = async {
+        let _ = engine_task.await;
+        for task in warp_tasks {
+            let _ = task.await;
+        }
+    };
+
+    if tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, shutdown_all)
+        .await
+        .is_err()
+    {
+        warn!(
+            "Shutdown timed out after {:?}; some child processes may be forcibly terminated by the OS.",
+            SUPERVISOR_SHUTDOWN_TIMEOUT
+        );
+    } else {
+        info!("All supervisor child processes stopped cleanly.");
+    }
 
     Ok(())
 }
