@@ -1,9 +1,9 @@
 services:
-  quirkproxy:
+  quirk:
     build:
       context: .
       dockerfile: Dockerfile
-    image: quirkproxy:v1
+    image: quirkproxy:v1.2
     container_name: quirkproxy
     restart: unless-stopped
     environment:
