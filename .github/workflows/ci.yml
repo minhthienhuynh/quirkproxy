@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, v1, v1.2-multi]
+    branches: [main, v1, v1.2, v1.2-multi]
     tags: ['v*']
   pull_request:
   workflow_dispatch:

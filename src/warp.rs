@@ -520,9 +520,9 @@ impl WarpPool {
         }
 
         // Two registrations can land on the same exit address. A duplicate
-        // makes the pool smaller than it looks, so recycle one of them in the
+        // makes the pool smaller than it looks, so recycle them in the
         // background (never block engine startup on a registration).
-        if let Some(idx) = self.duplicate_tunnel().await {
+        for idx in self.duplicate_tunnels().await {
             if let Some(t) = self.tunnels.get(idx).cloned() {
                 warn!(
                     "Tunnel {} duplicates another exit; recycling it (duplicate egress at startup)",
@@ -531,8 +531,7 @@ impl WarpPool {
                 let pool = self.clone();
                 tokio::spawn(async move {
                     if !t.recycling.swap(true, Ordering::SeqCst) {
-                        pool.recycle_inner(t, "duplicate egress at startup", false)
-                            .await;
+                        pool.recycle_locked(t, "duplicate egress at startup").await;
                     }
                 });
             }
@@ -541,20 +540,22 @@ impl WarpPool {
         handles
     }
 
-    /// Returns the index of a tunnel whose egress IP is shared with an earlier
+    /// Returns the indices of tunnels whose egress IP is shared with an earlier
     /// tunnel, if any.
-    async fn duplicate_tunnel(&self) -> Option<usize> {
+    async fn duplicate_tunnels(&self) -> Vec<usize> {
         let mut seen: Vec<String> = Vec::new();
+        let mut duplicates = Vec::new();
         for t in &self.tunnels {
             let ip = t.state.lock().await.ip.clone();
             if let Some(ip) = ip {
                 if seen.contains(&ip) {
-                    return Some(t.index);
+                    duplicates.push(t.index);
+                } else {
+                    seen.push(ip);
                 }
-                seen.push(ip);
             }
         }
-        None
+        duplicates
     }
 
     /// Picks the next tunnel for recycling, skipping ones that are already
@@ -604,46 +605,12 @@ impl WarpPool {
         let pool = self.clone();
         let reason = reason.to_string();
         tokio::spawn(async move {
-            pool.recycle_inner(tunnel, &reason, false).await;
+            pool.recycle_locked(tunnel, &reason).await;
         });
     }
 
-    /// Shared recycle body. `wait_for_drain` is true for operator-initiated
-    /// work (a manual rotation must not truncate client streams) and false for
-    /// a recycle triggered by a request that already failed.
-    ///
-    /// Returns the new egress IP when one could be verified.
-    async fn recycle_inner(
-        &self,
-        tunnel: Arc<Tunnel>,
-        reason: &str,
-        wait_for_drain: bool,
-    ) -> Option<String> {
-        if wait_for_drain && !self.drain_pool(&tunnel).await {
-            return None;
-        }
-        self.recycle_locked(tunnel, reason).await
-    }
-
-    /// Waits for the pool to go idle once. On timeout the recycle is abandoned:
-    /// re-registration tears the tunnel down, and cutting through an active
-    /// stream would truncate another client's response mid-token.
-    async fn drain_pool(&self, tunnel: &Arc<Tunnel>) -> bool {
-        if self.wait_for_drain(RECYCLE_DRAIN_TIMEOUT).await {
-            return true;
-        }
-        warn!(
-            "Tunnel {}: {} stream(s) still in flight after {:?}; deferring recycle.",
-            tunnel.index,
-            self.inflight_count(),
-            RECYCLE_DRAIN_TIMEOUT
-        );
-        tunnel.recycling.store(false, Ordering::SeqCst);
-        false
-    }
-
     /// Re-registers one tunnel while holding `recycle_lock`. The caller must
-    /// have drained already and claimed `tunnel.recycling`.
+    /// have claimed `tunnel.recycling`.
     async fn recycle_locked(&self, tunnel: Arc<Tunnel>, reason: &str) -> Option<String> {
         // Concurrent `wgcf register` runs in the same directory would corrupt
         // the identity files, so re-registrations are serialised pool-wide.
@@ -660,6 +627,7 @@ impl WarpPool {
                 // The supervisor owns the child: signal it so the restart picks
                 // up the freshly written config, and wait until it has.
                 if !restart_tunnel(&tunnel).await {
+                    tunnel.state.lock().await.last_recycle = Instant::now();
                     tunnel.recycling.store(false, Ordering::SeqCst);
                     return None;
                 }
@@ -712,6 +680,7 @@ impl WarpPool {
             }
             Err(e) => {
                 error!("Tunnel {}: re-registration failed: {:#}", tunnel.index, e);
+                tunnel.state.lock().await.last_recycle = Instant::now();
                 None
             }
         };
@@ -722,7 +691,7 @@ impl WarpPool {
 
     /// Operator-triggered rotation: refreshes every tunnel and waits for the
     /// work to complete. Returns the first egress IP observed.
-    pub async fn rotate_all(&self, reason: &str) -> Result<Option<String>> {
+    pub async fn rotate_all(&self, reason: &str) -> Result<String> {
         if !self.enabled() {
             anyhow::bail!("WARP pool is disabled");
         }
@@ -759,7 +728,7 @@ impl WarpPool {
             }
         }
 
-        Ok(first_ip)
+        first_ip.context("failed to verify any new egress IP across the pool")
     }
 
     pub async fn status(&self) -> WarpStatus {
@@ -959,5 +928,28 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handles = pool.start(shutdown).await;
         assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_tunnels_identifies_all_duplicates() {
+        let pool = pool_with(3);
+        pool.tunnels[0].state.lock().await.ip = Some("104.28.1.1".into());
+        pool.tunnels[1].state.lock().await.ip = Some("104.28.1.1".into());
+        pool.tunnels[2].state.lock().await.ip = Some("104.28.1.1".into());
+
+        let duplicates = pool.duplicate_tunnels().await;
+        assert_eq!(duplicates, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn failed_recycle_retains_cooldown() {
+        let pool = pool_with(1);
+        let tunnel = pool.tunnels[0].clone();
+
+        // A failed recycle or timeout sets last_recycle to Instant::now()
+        tunnel.state.lock().await.last_recycle = Instant::now();
+
+        // Must not be immediately picked again
+        assert!(pool.pick_tunnel().is_none());
     }
 }
