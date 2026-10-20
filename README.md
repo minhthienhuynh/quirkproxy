@@ -1,10 +1,10 @@
-# QuirkProxy v1.2.1
+# QuirkProxy v1.2.2
 
 Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2API** with a **multi-identity Cloudflare WARP egress pool**.
 
 ## Highlights
 
-- **Zero-Maintenance Core Engine**: Powered by upstream `opencode2api` (Go binary, v1.4.2). Automatically supports all upstream OpenCode gates (Bun uTLS fingerprinting, descending session IDs, genuine byte-matched tool schemas, and multi-protocol translation for OpenAI Chat, Responses, and Anthropic Messages).
+- **Zero-Maintenance Core Engine**: Powered by upstream `opencode2api` (Go binary, v1.4.3). Automatically supports all upstream OpenCode gates (Bun uTLS fingerprinting, descending session IDs, genuine byte-matched tool schemas, and multi-protocol translation for OpenAI Chat, Responses, and Anthropic Messages).
 - **Parallel WARP Egress Pool**: Instead of one identity rotated serially, the supervisor runs N independent WireGuard tunnels, each a separate WARP registration with its own egress IP. The engine receives one `socks5://...#pool` entry per tunnel, so a `429` on one exit retries on the *next* exit immediately instead of waiting ~30s for a re-registration that often returns the same address.
 - **Userspace Tunnelling**: Tunnels run through `wireproxy`, a userspace WireGuard client. No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no route changes — the host network stack and any host VPN/DNS/SSH setup stay untouched.
 - **Background Recycle**: When an exit burns out, one tunnel is re-registered in the background while the others keep serving. The request path never blocks on a registration. The tunnel is picked and claimed atomically, so concurrent refusals never recycle the same tunnel or drop one of the recycles.
