@@ -105,6 +105,21 @@ struct TunnelState {
     /// advance, which is how it knows the new config is actually in effect
     /// without inspecting the process table.
     spawn_generation: u64,
+    /// Incremented every time the supervisor *services* a restart request.
+    ///
+    /// `spawn_generation` alone is not enough evidence that a restart
+    /// happened: the supervisor also respawns on its own when the child
+    /// crashes, and that respawn would satisfy a wait on `spawn_generation`
+    /// without the freshly written config ever being loaded.
+    restart_generation: u64,
+    /// Set once the readiness probe for the current child has finished,
+    /// whether it produced an egress IP or not.
+    ///
+    /// Duplicate detection needs this: an egress IP is only known after a
+    /// probe succeeded, so a tunnel that has not finished probing yet looks
+    /// identical to one that has no exit address, and the comparison would
+    /// silently miss a duplicated pair.
+    probe_completed: bool,
 }
 
 pub struct Tunnel {
@@ -264,11 +279,82 @@ impl Tunnel {
         Ok(())
     }
 
+    /// Probes the tunnel's egress until it answers, or until the attempt
+    /// budget runs out, then publishes the result into the tunnel state.
+    ///
+    /// The probe runs as its own task so the supervisor keeps reacting to a
+    /// restart request (and to a dying child) while it is still in flight.
+    /// When the probe blocked the supervisor's `select!` directly, a recycle
+    /// that arrived during those ten seconds timed out waiting for the
+    /// restart and the rotation was silently lost.
+    ///
+    /// `generation` is the spawn generation the probe belongs to. A probe
+    /// whose tunnel has already been restarted must not publish its result:
+    /// it would resurrect the health of a child that no longer exists.
+    async fn probe_until_ready(self: &Arc<Self>, cancelled: &AtomicBool, generation: u64) {
+        let mut ready_ip = None;
+        for _ in 0..20 {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(ip) = self.probe_ip().await {
+                ready_ip = Some(ip);
+                break;
+            }
+        }
+
+        {
+            let mut st = self.state.lock().await;
+            if st.spawn_generation != generation {
+                // The tunnel was restarted while this probe was in flight.
+                // Its answer describes a child that is already gone.
+                return;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                // The child exited while this probe was in flight. Publishing
+                // the answer now would mark a dead child as healthy.
+                return;
+            }
+            match ready_ip.clone() {
+                Some(ip) => {
+                    st.ip = Some(ip);
+                    st.healthy = true;
+                }
+                None => {
+                    // A failed probe must not wipe a known-good exit address
+                    // and must not mark a recycled tunnel unhealthy: the
+                    // recycle path verifies the new egress on its own, and
+                    // nulling the IP here would make `/healthz` flap between
+                    // "healthy" and "no IP".
+                    if st.ip.is_none() {
+                        st.healthy = false;
+                    }
+                }
+            }
+            st.probe_completed = true;
+        }
+
+        match ready_ip {
+            Some(ip) => info!(
+                "Tunnel {} ready on :{} (egress {})",
+                self.index, self.port, ip
+            ),
+            None => warn!(
+                "Tunnel {} started on :{} but egress probe did not answer yet",
+                self.index, self.port
+            ),
+        }
+    }
+
     /// Runs `wireproxy` for this tunnel, restarting it with backoff whenever it
     /// exits unexpectedly, or immediately when a recycle asks for it through
     /// [`Tunnel::restart`]. This task owns the child handle, so restarting goes
     /// through it rather than through the process table.
-    async fn supervise(&self, shutdown: Arc<AtomicBool>) {
+    async fn supervise(self: &Arc<Self>, shutdown: Arc<AtomicBool>) {
         let mut backoff = Duration::from_secs(1);
 
         while !shutdown.load(Ordering::Relaxed) {
@@ -293,40 +379,29 @@ impl Tunnel {
             };
 
             let started = Instant::now();
-            {
+            let generation = {
                 let mut st = self.state.lock().await;
                 st.healthy = false;
+                st.probe_completed = false;
                 st.spawn_generation += 1;
-            }
+                st.spawn_generation
+            };
 
-            // First probe doubles as the readiness check: wireproxy answers on
-            // the SOCKS5 port before the WireGuard handshake completes, so
-            // probing through it is the only honest liveness signal.
-            let mut ready_ip = None;
-            for _ in 0..20 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Some(ip) = self.probe_ip().await {
-                    ready_ip = Some(ip);
-                    break;
-                }
-            }
-
+            // The readiness probe runs in its own task and publishes its
+            // result into the tunnel state. The supervisor therefore stays
+            // responsive to a restart request while the tunnel is still
+            // handshaking, and its `select!` keeps waiting on the child
+            // without a branch that could cancel the wait.
+            let cancelled = Arc::new(AtomicBool::new(false));
             {
-                let mut st = self.state.lock().await;
-                st.ip = ready_ip.clone();
-                st.healthy = ready_ip.is_some();
+                let me = self.clone();
+                let cancelled = cancelled.clone();
+                tokio::spawn(async move {
+                    me.probe_until_ready(&cancelled, generation).await;
+                });
             }
 
-            match ready_ip {
-                Some(ip) => info!(
-                    "Tunnel {} ready on :{} (egress {})",
-                    self.index, self.port, ip
-                ),
-                None => warn!(
-                    "Tunnel {} started on :{} but egress probe did not answer yet",
-                    self.index, self.port
-                ),
-            }
+            let mut respawn_now = false;
 
             tokio::select! {
                 status = child.wait() => {
@@ -335,26 +410,44 @@ impl Tunnel {
                         "Tunnel {}: wireproxy exited ({:?}) after {:?}",
                         self.index, status, uptime
                     );
+                    cancelled.store(true, Ordering::Relaxed);
                     self.state.lock().await.healthy = false;
                     if uptime >= TUNNEL_STABLE_UPTIME {
                         backoff = Duration::from_secs(1);
-                        continue;
+                        respawn_now = true;
                     }
                 }
                 _ = self.restart.notified() => {
                     info!("Tunnel {}: restart requested, stopping wireproxy...", self.index);
+                    cancelled.store(true, Ordering::Relaxed);
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    self.state.lock().await.healthy = false;
+                    {
+                        let mut st = self.state.lock().await;
+                        st.healthy = false;
+                        // Bump this *before* the next spawn so a waiter can
+                        // tell "restart serviced" from "child crashed and
+                        // was respawned".
+                        st.restart_generation += 1;
+                    }
                     backoff = Duration::from_secs(1);
-                    continue;
+                    respawn_now = true;
                 }
                 _ = wait_for_shutdown(&shutdown) => {
+                    cancelled.store(true, Ordering::Relaxed);
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     info!("Tunnel {}: stopped.", self.index);
                     return;
                 }
+            }
+
+            cancelled.store(true, Ordering::Relaxed);
+
+            if respawn_now {
+                // A restart or a stable crash: go straight back to a fresh
+                // child instead of backing off.
+                continue;
             }
 
             tokio::time::sleep(backoff).await;
@@ -411,6 +504,8 @@ impl WarpPool {
                         last_recycle: Instant::now() - RECYCLE_COOLDOWN,
                         healthy: false,
                         spawn_generation: 0,
+                        restart_generation: 0,
+                        probe_completed: false,
                     }),
                     recycling: AtomicBool::new(false),
                     restart: tokio::sync::Notify::new(),
@@ -430,7 +525,14 @@ impl WarpPool {
         }
     }
 
+    /// SOCKS5 proxy URLs of every tunnel in the pool.
+    ///
+    /// Empty when the pool is disabled: there is no tunnel behind those ports
+    /// then, and pointing a client at them only produces connection refusals.
     pub fn proxy_urls(&self) -> Vec<String> {
+        if !self.enabled() {
+            return Vec::new();
+        }
         self.tunnels.iter().map(|t| t.proxy_url()).collect()
     }
 
@@ -522,6 +624,45 @@ impl WarpPool {
         // Two registrations can land on the same exit address. A duplicate
         // makes the pool smaller than it looks, so recycle them in the
         // background (never block engine startup on a registration).
+        //
+        // The comparison waits for every tunnel's readiness probe to finish:
+        // an egress IP is only known after a successful probe, so checking
+        // while some tunnels are still probing would report "no duplicates"
+        // for a pool that is actually sharing exits.
+        let pool = self.clone();
+        tokio::spawn(async move {
+            pool.recycle_duplicate_egresses().await;
+        });
+
+        handles
+    }
+
+    /// Waits for every tunnel's readiness probe to complete, then recycles the
+    /// tunnels that share an exit address with an earlier one.
+    async fn recycle_duplicate_egresses(self: &Arc<Self>) {
+        let deadline = Instant::now() + TUNNEL_READY_TIMEOUT;
+        loop {
+            let mut pending = false;
+            for t in &self.tunnels {
+                if !t.state.lock().await.probe_completed {
+                    pending = true;
+                    break;
+                }
+            }
+            if !pending {
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    "Not every tunnel finished its readiness probe within {:?}; \
+                     duplicate egress detection is partial",
+                    TUNNEL_READY_TIMEOUT
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
         for idx in self.duplicate_tunnels().await {
             if let Some(t) = self.tunnels.get(idx).cloned() {
                 warn!(
@@ -536,17 +677,26 @@ impl WarpPool {
                 });
             }
         }
-
-        handles
     }
 
     /// Returns the indices of tunnels whose egress IP is shared with an earlier
     /// tunnel, if any.
+    ///
+    /// Only tunnels whose readiness probe has completed take part: an egress
+    /// IP is only known after a successful probe, so a tunnel that is still
+    /// probing has no address to compare yet and would make a duplicated pair
+    /// look unique.
     async fn duplicate_tunnels(&self) -> Vec<usize> {
         let mut seen: Vec<String> = Vec::new();
         let mut duplicates = Vec::new();
         for t in &self.tunnels {
-            let ip = t.state.lock().await.ip.clone();
+            let ip = {
+                let st = t.state.lock().await;
+                if !st.probe_completed {
+                    continue;
+                }
+                st.ip.clone()
+            };
             if let Some(ip) = ip {
                 if seen.contains(&ip) {
                     duplicates.push(t.index);
@@ -558,27 +708,36 @@ impl WarpPool {
         duplicates
     }
 
-    /// Picks the next tunnel for recycling, skipping ones that are already
-    /// re-registering or were recycled inside `RECYCLE_COOLDOWN`.
-    fn pick_tunnel(&self) -> Option<Arc<Tunnel>> {
+    /// Picks the next tunnel for recycling *and* claims it, in one step.
+    ///
+    /// Picking and claiming separately loses recycles: two concurrent 429s
+    /// can both observe the same tunnel as free, and the loser of the claim
+    /// silently drops its recycle while the tunnel it wanted stays burned.
+    /// Claiming with a compare-exchange inside the selection loop makes the
+    /// loser move on to the next candidate instead.
+    fn claim_tunnel(&self) -> Option<Arc<Tunnel>> {
         let n = self.tunnels.len();
         if n == 0 {
             return None;
         }
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        for step in 0..n {
-            let t = &self.tunnels[(start + step) % n];
+        for _ in 0..n {
+            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+            let t = &self.tunnels[start % n];
             if t.recycling.load(Ordering::Relaxed) {
                 continue;
             }
-            // `try_lock` is deliberate: a tunnel whose state is locked is being
-            // written by its supervisor right now, so it is not a good
-            // candidate either. Skipping it costs one round of the loop.
-            if let Ok(st) = t.state.try_lock() {
-                if st.last_recycle.elapsed() < RECYCLE_COOLDOWN {
-                    continue;
-                }
-            } else {
+            let eligible = match t.state.try_lock() {
+                Ok(st) => st.last_recycle.elapsed() >= RECYCLE_COOLDOWN,
+                Err(_) => false,
+            };
+            if !eligible {
+                continue;
+            }
+            if t.recycling
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // Another caller claimed it first; try the next candidate.
                 continue;
             }
             return Some(t.clone());
@@ -595,12 +754,9 @@ impl WarpPool {
         if !self.enabled() {
             return;
         }
-        let Some(tunnel) = self.pick_tunnel() else {
+        let Some(tunnel) = self.claim_tunnel() else {
             return;
         };
-        if tunnel.recycling.swap(true, Ordering::SeqCst) {
-            return;
-        }
 
         let pool = self.clone();
         let reason = reason.to_string();
@@ -645,7 +801,11 @@ impl WarpPool {
                     let mut st = tunnel.state.lock().await;
                     st.last_recycle = Instant::now();
                     st.healthy = new_ip.is_some();
+                    // After a recycle the tunnel runs a fresh identity, so the
+                    // previous exit address is stale: report the new one, or
+                    // nothing at all when it could not be verified.
                     st.ip = new_ip.clone();
+                    st.probe_completed = true;
                 }
 
                 match new_ip.clone() {
@@ -761,21 +921,29 @@ impl WarpPool {
 /// point: a name-based signal matches the whole command line, so an unrelated
 /// process whose arguments happen to contain this tunnel's config path would be
 /// killed too, and a prefix such as `id1` would also match `id10`.
+///
+/// The wait requires *both* generations to advance: `restart_generation`
+/// proves the supervisor serviced this request, and `spawn_generation` proves
+/// the replacement child exists. Waiting on the spawn counter alone would be
+/// satisfied by a crash-driven respawn, which would leave the old config
+/// running while the caller believed the rotation had been applied.
 async fn restart_tunnel(tunnel: &Arc<Tunnel>) -> bool {
-    let before = tunnel.state.lock().await.spawn_generation;
+    let (before_restart, before_spawn) = {
+        let st = tunnel.state.lock().await;
+        (st.restart_generation, st.spawn_generation)
+    };
     tunnel.restart.notify_one();
 
-    // The supervisor increments the generation right after spawning. Waiting for
-    // it means the probe below talks to the new process, not the dying one.
-    for _ in 0..40 {
+    for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        if tunnel.state.lock().await.spawn_generation > before {
+        let st = tunnel.state.lock().await;
+        if st.restart_generation > before_restart && st.spawn_generation > before_spawn {
             return true;
         }
     }
 
     warn!(
-        "Tunnel {}: supervisor did not restart wireproxy within 10s.",
+        "Tunnel {}: supervisor did not restart wireproxy within 20s.",
         tunnel.index
     );
     false
@@ -843,8 +1011,9 @@ mod tests {
         let pool = pool_with(1);
         let tunnel = pool.tunnels[0].clone();
 
-        // First pick succeeds: the initial state is backdated past the cooldown.
-        assert!(pool.pick_tunnel().is_some());
+        // First claim succeeds: the initial state is backdated past the cooldown.
+        assert!(pool.claim_tunnel().is_some());
+        tunnel.recycling.store(false, Ordering::SeqCst);
 
         // Simulate a recycle that just completed.
         tunnel.state.lock().await.last_recycle = Instant::now();
@@ -852,7 +1021,7 @@ mod tests {
         // The only tunnel is now inside the cooldown window, so nothing may be
         // picked. Before the fix this returned the same tunnel immediately and
         // a burst of 429s burned identities back to back.
-        assert!(pool.pick_tunnel().is_none());
+        assert!(pool.claim_tunnel().is_none());
     }
 
     #[tokio::test]
@@ -864,16 +1033,39 @@ mod tests {
 
         // The cooled-down tunnel is skipped but the other one is still usable.
         for _ in 0..4 {
-            let picked = pool.pick_tunnel().expect("a tunnel should be available");
+            let picked = pool.claim_tunnel().expect("a tunnel should be available");
             assert_ne!(picked.index, first.index);
+            picked.recycling.store(false, Ordering::SeqCst);
         }
     }
 
     #[tokio::test]
-    async fn pick_skips_tunnels_already_recycling() {
+    async fn claim_skips_tunnels_already_recycling() {
         let pool = pool_with(1);
         pool.tunnels[0].recycling.store(true, Ordering::SeqCst);
-        assert!(pool.pick_tunnel().is_none());
+        assert!(pool.claim_tunnel().is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_never_hands_the_same_tunnel_to_two_callers() {
+        let pool = pool_with(1);
+
+        // The claim is part of the selection: a second caller must not be able
+        // to pick the tunnel the first one already claimed.
+        let first = pool.claim_tunnel().expect("the tunnel should be claimable");
+        assert_eq!(first.index, 0);
+        assert!(pool.claim_tunnel().is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_moves_on_to_the_next_tunnel_when_the_first_is_taken() {
+        let pool = pool_with(2);
+        pool.tunnels[0].recycling.store(true, Ordering::SeqCst);
+
+        let picked = pool
+            .claim_tunnel()
+            .expect("the free tunnel should be claimable");
+        assert_eq!(picked.index, 1);
     }
 
     #[tokio::test]
@@ -913,9 +1105,10 @@ mod tests {
             false,
         ));
         assert!(!pool.enabled());
-        // proxy_urls() still lists the tunnels so the engine config can be
-        // generated, but `enabled()` gates every recycle path.
-        assert_eq!(pool.proxy_urls().len(), 3);
+        // The engine config is built from the pool's proxy URLs. With the pool
+        // disabled the engine must not be pointed at SOCKS endpoints that
+        // nothing listens on.
+        assert!(pool.proxy_urls().is_empty());
     }
 
     #[tokio::test]
@@ -933,12 +1126,35 @@ mod tests {
     #[tokio::test]
     async fn duplicate_tunnels_identifies_all_duplicates() {
         let pool = pool_with(3);
-        pool.tunnels[0].state.lock().await.ip = Some("104.28.1.1".into());
-        pool.tunnels[1].state.lock().await.ip = Some("104.28.1.1".into());
-        pool.tunnels[2].state.lock().await.ip = Some("104.28.1.1".into());
+        for t in &pool.tunnels {
+            let mut st = t.state.lock().await;
+            st.ip = Some("104.28.1.1".into());
+            st.probe_completed = true;
+        }
 
         let duplicates = pool.duplicate_tunnels().await;
         assert_eq!(duplicates, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_tunnels_ignores_tunnels_that_have_not_probed_yet() {
+        let pool = pool_with(2);
+        {
+            let mut st = pool.tunnels[0].state.lock().await;
+            st.ip = Some("104.28.1.1".into());
+            st.probe_completed = true;
+        }
+        {
+            // Same address, but this tunnel has not finished probing: its
+            // address is not known yet, so it must not be compared.
+            let mut st = pool.tunnels[1].state.lock().await;
+            st.ip = Some("104.28.1.1".into());
+            st.probe_completed = false;
+        }
+
+        // Before the fix the pair was reported as a duplicate even though the
+        // second tunnel had not produced an address at all.
+        assert!(pool.duplicate_tunnels().await.is_empty());
     }
 
     #[tokio::test]
@@ -950,6 +1166,6 @@ mod tests {
         tunnel.state.lock().await.last_recycle = Instant::now();
 
         // Must not be immediately picked again
-        assert!(pool.pick_tunnel().is_none());
+        assert!(pool.claim_tunnel().is_none());
     }
 }

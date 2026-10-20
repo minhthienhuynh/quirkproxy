@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +104,25 @@ struct EngineHealth {
     models_loaded: u64,
 }
 
+/// Compares two secrets without leaking their contents through timing.
+///
+/// A plain `==` on strings short-circuits on the first differing byte, which
+/// is enough to recover a bearer token one byte at a time given enough
+/// requests. The length is compared first (it is not secret), then every
+/// byte is folded into an accumulator so the comparison takes the same time
+/// for every input.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn trigger_rotate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -126,7 +145,7 @@ pub async fn trigger_rotate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
 
-    if provided != state.config.server_key {
+    if !constant_time_eq(provided, &state.config.server_key) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -161,6 +180,12 @@ pub async fn trigger_rotate(
 
 /// Generates a fast, cryptographically unique OpenCode CLI 2.x session ID
 /// Format: ses_<12-hex-inverted-timestamp><14-base62-random>
+///
+/// The hex part carries an inverted timestamp so that newer sessions sort
+/// before older ones. The low 12 bits of the timestamp field are replaced by a
+/// fixed constant, which is why the random counter is folded into the base62
+/// suffix instead: entropy that is masked off before formatting would have no
+/// effect on the generated id at all.
 fn make_session_id() -> String {
     use std::time::SystemTime;
     let now_ms = SystemTime::now()
@@ -175,8 +200,15 @@ fn make_session_id() -> String {
 
     const BASE62: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let rand_b62: String = (0..14)
-        .map(|_| {
-            let idx = fastrand::usize(..BASE62.len());
+        .map(|i| {
+            // The counter perturbs the first character so that two ids
+            // generated in the same millisecond still differ even if the
+            // random draw repeats.
+            let idx = if i == 0 {
+                counter as usize % BASE62.len()
+            } else {
+                fastrand::usize(..BASE62.len())
+            };
             BASE62[idx] as char
         })
         .collect();
@@ -202,16 +234,45 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         }
     }
 
-    // Buffer request body to allow replay on 429/403 auto-healing retry
-    let body_bytes: Bytes = match req.into_body().collect().await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            // Guard against OOM: prompts+images can be large, but unbounded buffering
-            // of a multi-GB body would kill the container.
-            if bytes.len() > MAX_BODY_BYTES {
+    // Buffer the request body to allow replay on 429/403 auto-healing retry.
+    //
+    // The size limit has to be enforced *while* reading, not after: the body
+    // is fully materialised in memory before it can be measured, so a
+    // multi-gigabyte upload would OOM the container long before the check
+    // below could reject it. `Limited` stops the read at the cap and
+    // `content-length` rejects an oversized body without reading it at all.
+    if let Some(len) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if len > MAX_BODY_BYTES {
+            warn!(
+                "Rejecting request body of {} bytes (limit {})",
+                len, MAX_BODY_BYTES
+            );
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": { "message": "Request body too large" } })),
+            )
+                .into_response();
+        }
+    }
+
+    let body_bytes: Bytes = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            // A body that grew past the cap while streaming is the same
+            // condition as one that declared an oversized length.
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
                 warn!(
-                    "Rejecting request body of {} bytes (limit {})",
-                    bytes.len(),
+                    "Rejecting request body larger than the limit ({} bytes)",
                     MAX_BODY_BYTES
                 );
                 return (
@@ -220,9 +281,6 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 )
                     .into_response();
             }
-            bytes
-        }
-        Err(e) => {
             error!("Failed to read incoming request body: {}", e);
             return StatusCode::BAD_REQUEST.into_response();
         }
@@ -235,6 +293,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     } else {
         1
     };
+
+    // The in-flight guard is taken before the first upstream attempt, not
+    // after its response headers arrive. Counting only from the response
+    // onwards hides requests that are still waiting on the upstream, and a
+    // manual rotation would then tear down a tunnel under a request that was
+    // still in flight.
+    let mut inflight = Some(state.warp.begin_request());
 
     let mut attempt = 0;
     while attempt < max_retries {
@@ -358,9 +423,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
         // The guard is moved into the body stream so the pool counts as busy
         // until the last byte reaches the client, not just until headers arrive.
-        let guard = state.warp.begin_request();
         let stream = res.bytes_stream();
-        let body = Body::from_stream(StreamGuard::new(guard, stream));
+        let body = match inflight.take() {
+            Some(guard) => Body::from_stream(StreamGuard::new(guard, stream)),
+            // Unreachable in practice: the guard is taken exactly once per
+            // request, on the path that returns a response body.
+            None => Body::from_stream(stream),
+        };
 
         return build_response(status, &res_headers, body);
     }
@@ -413,5 +482,44 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+
+    #[test]
+    fn constant_time_eq_matches_equal_and_unequal_secrets() {
+        assert!(constant_time_eq("local-test-key", "local-test-key"));
+        assert!(!constant_time_eq("local-test-key", "local-test-kex"));
+        assert!(!constant_time_eq("local-test-key", "local-test-ke"));
+        assert!(!constant_time_eq("local-test-key", ""));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[tokio::test]
+    async fn body_under_the_limit_is_read_completely() {
+        let payload = Bytes::from_static(b"hello");
+        let body = Limited::new(Body::from(payload.clone()), MAX_BODY_BYTES);
+        let collected = body.collect().await.expect("body should be readable");
+        assert_eq!(collected.to_bytes(), payload);
+    }
+
+    #[tokio::test]
+    async fn body_over_the_limit_is_rejected_while_reading() {
+        let payload = Bytes::from(vec![b'x'; MAX_BODY_BYTES + 1]);
+        let body = Limited::new(Body::from(payload), MAX_BODY_BYTES);
+        let err = body
+            .collect()
+            .await
+            .expect_err("oversized body must be rejected");
+        assert!(
+            err.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some(),
+            "expected a length limit error, got: {err}"
+        );
     }
 }
