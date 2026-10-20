@@ -10,12 +10,17 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8080}
       - OPENCODE2API_PORT=${OPENCODE2API_PORT:-18088}
+      - UPSTREAM_API=${UPSTREAM_API:-http://127.0.0.1:18088}
       - WARP_ENABLED=${WARP_ENABLED:-true}
       - WARP_IDENTITIES=${WARP_IDENTITIES:-3}
       - WARP_BASE_SOCKS_PORT=${WARP_BASE_SOCKS_PORT:-40001}
       - WARP_STATE_DIR=${WARP_STATE_DIR:-/app/warp}
       - WARP_AUTO_ROTATE_429=${WARP_AUTO_ROTATE_429:-true}
       - WARP_AUTO_ROTATE_403=${WARP_AUTO_ROTATE_403:-true}
+      # With a multi-node pool the engine hops between the proxies itself, so
+      # an extra supervisor-level retry only multiplies the leg count and the
+      # latency. Keep this at 1 unless the pool has a single identity.
+      - MAX_RETRIES=${MAX_RETRIES:-1}
       - SERVER_KEY=${SERVER_KEY:-local-test-key}
     # No cap_add / devices: wireproxy speaks WireGuard in userspace, so the
     # container never creates a tun device nor touches host routing.

@@ -29,7 +29,9 @@ QuirkProxy is a Rust supervisor and reverse proxy wrapping `opencode2api` (core 
      fail identically on a new egress and are returned to the client as-is.
 
 5. **In-flight guard (`src/warp.rs`)**:
-   - each streamed response holds an RAII guard until its final byte.
+   - each streamed response holds an RAII guard until its final byte, and the
+     guard is taken *before* the upstream call so requests still waiting on the
+     upstream count as in flight as well.
    - operator-triggered rotations wait up to 30s for the pool to drain;
      request-triggered recycles skip the wait, because the triggering request
      has already failed.
@@ -39,6 +41,11 @@ QuirkProxy is a Rust supervisor and reverse proxy wrapping `opencode2api` (core 
      probe (max 30s) before the engine is spawned. The engine fetches its model
      catalog once at startup; if it runs while every SOCKS5 port is still
      closed, the catalog stays empty until the next refresh window.
+   - the readiness probe runs in its own task, so the supervisor keeps
+     answering restart requests while a tunnel is still handshaking, and a
+     recycle that arrives in that window is no longer lost.
+   - duplicate egress detection waits until every tunnel's probe has finished
+     before comparing addresses.
 
 ## Commands
 

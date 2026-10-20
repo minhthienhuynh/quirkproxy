@@ -73,6 +73,15 @@ impl Config {
         // fall back to the default the way a missing variable would.
         let warp_identities = env_parse::<usize>("WARP_IDENTITIES", 3);
 
+        // The engine builds one anonymous node per pool entry and hops
+        // between them on its own retries. A supervisor-level retry on top of
+        // that multiplies the leg count (engine legs x supervisor attempts)
+        // and the latency without reaching a different exit faster, so the
+        // default is one attempt as soon as the pool has more than one
+        // identity. A single-identity pool has no engine-side hopping, so the
+        // supervisor retry is the only retry there.
+        let default_max_retries = if warp_identities > 1 { 1 } else { 3 };
+
         Self {
             host,
             port,
@@ -84,7 +93,7 @@ impl Config {
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
             warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
-            max_retries: env_parse("MAX_RETRIES", 3).max(1),
+            max_retries: env_parse("MAX_RETRIES", default_max_retries).max(1),
             opencode2api_bin: env::var("OPENCODE2API_BIN")
                 .unwrap_or_else(|_| "/usr/local/bin/opencode2api".to_string()),
             opencode2api_config: env::var("OPENCODE2API_CONFIG")
@@ -98,8 +107,17 @@ impl Config {
         self.warp_base_socks_port + index as u16
     }
 
-    /// Every tunnel proxy URL, in the `#pool` form the engine understands.
+    /// Every SOCKS5 proxy URL, in the `#pool` form the engine understands.
+    ///
+    /// The list is empty when the pool is disabled: the engine then talks to
+    /// the upstream directly. Handing it dead SOCKS endpoints instead makes
+    /// every upstream call fail with `proxy_error`, because the engine keeps
+    /// routing through the configured proxies no matter how many of them
+    /// refuse the connection.
     pub fn proxy_urls(&self) -> Vec<String> {
+        if !self.warp_enabled || self.warp_identities == 0 {
+            return Vec::new();
+        }
         (0..self.warp_identities)
             .map(|i| format!("socks5://127.0.0.1:{}#pool", self.tunnel_port(i)))
             .collect()
@@ -144,6 +162,17 @@ mod tests {
     fn no_identities_means_no_proxies() {
         let mut cfg = Config::from_env();
         cfg.warp_identities = 0;
+        assert!(cfg.proxy_urls().is_empty());
+    }
+
+    #[test]
+    fn disabled_pool_means_no_proxies() {
+        let mut cfg = Config::from_env();
+        cfg.warp_enabled = false;
+        cfg.warp_identities = 3;
+        // The engine must not be pointed at SOCKS endpoints that nothing
+        // listens on: with WARP disabled every upstream call would fail with
+        // `proxy_error` instead of going out directly.
         assert!(cfg.proxy_urls().is_empty());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "quirkproxy"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["Minh Thien Huynh"]
 description = "High-performance Rust Supervisor & Auto-Healing Reverse Proxy for OpenCode2API with a multi-identity Cloudflare WARP egress pool"

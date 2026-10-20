@@ -22,7 +22,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
 # Release profile already sets strip = true and panic = abort (see Cargo.toml).
-RUN cargo build --release
+# --locked keeps the build on exactly the dependency versions in Cargo.lock.
+RUN cargo build --release --locked
 
 # ==============================================================================
 # Stage 2: Minimal Runtime with userspace WARP tunnels and opencode2api engine

@@ -1,4 +1,4 @@
-# QuirkProxy v1.2
+# QuirkProxy v1.2.1
 
 Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2API** with a **multi-identity Cloudflare WARP egress pool**.
 
@@ -7,10 +7,10 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 - **Zero-Maintenance Core Engine**: Powered by upstream `opencode2api` (Go binary, v1.4.2). Automatically supports all upstream OpenCode gates (Bun uTLS fingerprinting, descending session IDs, genuine byte-matched tool schemas, and multi-protocol translation for OpenAI Chat, Responses, and Anthropic Messages).
 - **Parallel WARP Egress Pool**: Instead of one identity rotated serially, the supervisor runs N independent WireGuard tunnels, each a separate WARP registration with its own egress IP. The engine receives one `socks5://...#pool` entry per tunnel, so a `429` on one exit retries on the *next* exit immediately instead of waiting ~30s for a re-registration that often returns the same address.
 - **Userspace Tunnelling**: Tunnels run through `wireproxy`, a userspace WireGuard client. No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no route changes — the host network stack and any host VPN/DNS/SSH setup stay untouched.
-- **Background Recycle**: When an exit burns out, one tunnel is re-registered in the background while the others keep serving. The request path never blocks on a registration.
+- **Background Recycle**: When an exit burns out, one tunnel is re-registered in the background while the others keep serving. The request path never blocks on a registration. The tunnel is picked and claimed atomically, so concurrent refusals never recycle the same tunnel or drop one of the recycles.
 - **Refusal-Aware Rotation**: A `403` is not one condition. The supervisor classifies it into `quota` / `abuse` / `shape` / `geo` / `auth` / `version` and only recycles a tunnel for causes a new egress can actually fix.
-- **Stream-Safe**: Every in-flight response holds a guard until its last byte, so a manual rotation drains the pool first instead of truncating another client's stream mid-token.
-- **Duplicate Detection**: Cloudflare sometimes issues the same exit address to two registrations; the pool detects a duplicate at startup and recycles one.
+- **Stream-Safe**: Every in-flight response holds a guard until its last byte, so a manual rotation drains the pool first instead of truncating another client's stream mid-token. The guard is taken before the upstream call, so requests still waiting on the upstream count as in flight too.
+- **Duplicate Detection**: Cloudflare sometimes issues the same exit address to two registrations; the pool detects a duplicate at startup and recycles one. The comparison waits until every tunnel's readiness probe has finished, so a tunnel that has not produced an address yet is not mistaken for a unique one.
 - **Single Container**: `wgcf`, `wireproxy`, `opencode2api` and the Rust supervisor live in one image. No sidecars, no extra proxy nodes, no dedupe arbiter.
 
 ## Architecture
@@ -57,8 +57,14 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 | `WARP_STATE_DIR` | `/app/warp` | Where per-identity WireGuard profiles are stored |
 | `WARP_AUTO_ROTATE_429` | `true` | Recycle a tunnel on upstream `429` |
 | `WARP_AUTO_ROTATE_403` | `true` | Recycle a tunnel on a rotation-eligible `403` |
-| `MAX_RETRIES` | `3` | Upstream attempts per client request |
+| `MAX_RETRIES` | `1` with a multi-identity pool, else `3` | Upstream attempts per client request. The engine hops between pool nodes on its own, so an extra supervisor-level attempt only multiplies the leg count and the latency. |
+| `UPSTREAM_API` | `http://127.0.0.1:18088` | Base URL of the `opencode2api` engine |
 | `SERVER_KEY` | `local-test-key` | Bearer token for `POST /v1/rotate` |
+
+> **Change `SERVER_KEY` before exposing the service.** The default is a
+> well-known value, and the container listens on the shared `dokploy-network`,
+> so any sibling container can reach `POST /v1/rotate` with it. The token is
+> compared in constant time, but that only removes the timing side channel.
 
 ## Quick Start
 
@@ -105,6 +111,19 @@ new identities and rotate all egress IPs.
 | `403` request shape | **no** | headers/tools/session id — no address makes it pass |
 | `403` region block | **no** | a new registration stays in the same colo |
 | `403` auth / version | **no** | not an egress problem |
+
+A recycle picks a tunnel that is free (not already re-registering, not inside
+the 60 s cooldown) and claims it in the same step, so two concurrent `429`s
+never end up recycling the same tunnel or silently dropping one of the
+recycles.
+
+## Turning the pool off
+
+`WARP_ENABLED=false` (or `WARP_IDENTITIES=0`) disables the pool entirely: no
+tunnel is started, and the engine is configured **without** SOCKS proxies so
+it talks to the upstream directly. Pointing the engine at SOCKS endpoints that
+nothing listens on would make every upstream call fail with
+`all proxies are unavailable` instead.
 
 ## Development
 
