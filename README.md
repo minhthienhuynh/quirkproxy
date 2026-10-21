@@ -12,6 +12,7 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 - **Stream-Safe**: Every in-flight response holds a guard until its last byte, so a manual rotation drains the pool first instead of truncating another client's stream mid-token. The guard is taken before the upstream call, so requests still waiting on the upstream count as in flight too.
 - **Duplicate Detection**: Cloudflare sometimes issues the same exit address to two registrations; the pool detects a duplicate at startup and recycles one. The comparison waits until every tunnel's readiness probe has finished, so a tunnel that has not produced an address yet is not mistaken for a unique one.
 - **Single Container**: `wgcf`, `wireproxy`, `opencode2api` and the Rust supervisor live in one image. No sidecars, no extra proxy nodes, no dedupe arbiter.
+- **Multi-Arch**: Dual native support for both `linux/amd64` and `linux/arm64` published as a multi-platform manifest list.
 
 ## Architecture
 
