@@ -73,7 +73,7 @@ RUN ARCH=$(dpkg --print-architecture) \
 # 2. Download official opencode2api release binary
 RUN ARCH=$(dpkg --print-architecture) \
     && echo "Downloading opencode2api ${OPENCODE2API_VERSION} for ${ARCH}..." \
-    && curl -sL "https://github.com/jasonxu114514/opencode2api/releases/download/${OPENCODE2API_VERSION}/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /tmp \
+    && curl -fsSL "https://github.com/jasonxu114514/opencode2api/releases/download/${OPENCODE2API_VERSION}/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /tmp \
     && mv /tmp/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}/opencode2api /usr/local/bin/opencode2api \
     && chmod +x /usr/local/bin/opencode2api \
     && rm -rf /tmp/opencode2api*
