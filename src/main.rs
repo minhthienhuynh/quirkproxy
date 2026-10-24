@@ -124,15 +124,16 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
             }
         };
 
-        backoff = Duration::from_secs(1);
         let started = std::time::Instant::now();
 
         tokio::select! {
             status = child.wait() => {
                 let uptime = started.elapsed();
                 warn!("opencode2api exited ({:?}) after {:?}", status, uptime);
-                // If it ran a while before dying, restart immediately.
+                // Only a run that stayed up long enough resets the backoff.
+                // A child that dies quickly keeps growing the delay.
                 if uptime >= ENGINE_STABLE_UPTIME {
+                    backoff = Duration::from_secs(1);
                     continue;
                 }
             }
