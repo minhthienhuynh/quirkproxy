@@ -35,6 +35,61 @@ const ENGINE_READY_POLL: Duration = Duration::from_millis(500);
 const ENGINE_STABLE_UPTIME: Duration = Duration::from_secs(30);
 /// Grace period for the engine to exit after SIGKILL on shutdown.
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for the engine restart delay.
+const ENGINE_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// What the supervisor must do once the engine child exits.
+#[derive(Debug, PartialEq, Eq)]
+enum EngineExitAction {
+    /// The run was long enough to count as stable: respawn immediately.
+    RespawnNow,
+    /// The run was a crash: sleep for this delay, then respawn.
+    SleepThenRespawn(Duration),
+}
+
+/// Restart delay for the engine supervisor.
+///
+/// The delay starts at one second and doubles on every failed spawn or
+/// short-lived child, capped at [`ENGINE_MAX_BACKOFF`]. Only a run that stayed
+/// up for at least [`ENGINE_STABLE_UPTIME`] resets it, so an engine that dies
+/// during startup backs off instead of being respawned in a tight loop.
+#[derive(Debug)]
+struct RestartBackoff {
+    next: Duration,
+}
+
+impl RestartBackoff {
+    fn new() -> Self {
+        Self {
+            next: Duration::from_secs(1),
+        }
+    }
+
+    /// Delay to use before the next spawn attempt.
+    #[cfg(test)]
+    fn delay(&self) -> Duration {
+        self.next
+    }
+
+    /// Records a child exit and reports what the supervisor should do next.
+    fn on_child_exit(&mut self, uptime: Duration) -> EngineExitAction {
+        if uptime >= ENGINE_STABLE_UPTIME {
+            self.next = Duration::from_secs(1);
+            EngineExitAction::RespawnNow
+        } else {
+            let delay = self.next;
+            self.next = (self.next * 2).min(ENGINE_MAX_BACKOFF);
+            EngineExitAction::SleepThenRespawn(delay)
+        }
+    }
+
+    /// Records a failed spawn and returns the delay to sleep before retrying.
+    fn on_spawn_failure(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(ENGINE_MAX_BACKOFF);
+        delay
+    }
+}
 
 fn ensure_opencode2api_config(config: &Config) -> Result<()> {
     // The config is fully derived from env, so it must be regenerated on each boot.
@@ -99,7 +154,7 @@ fn ensure_opencode2api_config(config: &Config) -> Result<()> {
 /// Runs `opencode2api` as a managed child process, restarting it with
 /// exponential backoff when it exits unexpectedly.
 async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = RestartBackoff::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         info!(
@@ -114,12 +169,12 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
+                let delay = backoff.on_spawn_failure();
                 error!(
                     "Failed to spawn opencode2api: {}. Retrying in {:?}",
-                    e, backoff
+                    e, delay
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -132,9 +187,12 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
                 warn!("opencode2api exited ({:?}) after {:?}", status, uptime);
                 // Only a run that stayed up long enough resets the backoff.
                 // A child that dies quickly keeps growing the delay.
-                if uptime >= ENGINE_STABLE_UPTIME {
-                    backoff = Duration::from_secs(1);
-                    continue;
+                match backoff.on_child_exit(uptime) {
+                    EngineExitAction::RespawnNow => continue,
+                    EngineExitAction::SleepThenRespawn(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                 }
             }
             _ = wait_for_shutdown(&shutdown) => {
@@ -143,9 +201,6 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
                 return;
             }
         }
-
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -312,5 +367,129 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("Received SIGINT signal"),
         _ = terminate => info!("Received SIGTERM signal"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Uptime that the supervisor considers a one-off crash, not a crash loop.
+    fn crashing() -> Duration {
+        Duration::from_millis(50)
+    }
+
+    /// Uptime that the supervisor considers a healthy run.
+    fn stable() -> Duration {
+        ENGINE_STABLE_UPTIME
+    }
+
+    #[test]
+    fn backoff_starts_at_one_second() {
+        assert_eq!(RestartBackoff::new().delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn short_lived_child_grows_the_delay_geometrically() {
+        let mut backoff = RestartBackoff::new();
+        let delays: Vec<Duration> = (0..5)
+            .map(|_| match backoff.on_child_exit(crashing()) {
+                EngineExitAction::SleepThenRespawn(delay) => delay,
+                EngineExitAction::RespawnNow => {
+                    panic!("a crash must not be respawned immediately")
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+            ]
+        );
+    }
+
+    #[test]
+    fn crash_loop_delay_is_capped() {
+        let mut backoff = RestartBackoff::new();
+        // 1, 2, 4, 8, 16, 30, 30, ... — the cap must hold no matter how long
+        // the engine keeps dying during startup.
+        for _ in 0..20 {
+            backoff.on_child_exit(crashing());
+        }
+        assert_eq!(backoff.delay(), ENGINE_MAX_BACKOFF);
+
+        match backoff.on_child_exit(crashing()) {
+            EngineExitAction::SleepThenRespawn(delay) => assert_eq!(delay, ENGINE_MAX_BACKOFF),
+            EngineExitAction::RespawnNow => panic!("a crash must not be respawned immediately"),
+        }
+    }
+
+    #[test]
+    fn stable_run_resets_the_delay_and_respawns_immediately() {
+        let mut backoff = RestartBackoff::new();
+        // Walk the delay up so a reset is observable.
+        backoff.on_child_exit(crashing());
+        backoff.on_child_exit(crashing());
+        backoff.on_child_exit(crashing());
+        assert_eq!(backoff.delay(), Duration::from_secs(8));
+
+        assert_eq!(
+            backoff.on_child_exit(stable()),
+            EngineExitAction::RespawnNow
+        );
+        assert_eq!(backoff.delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stable_run_below_threshold_still_backs_off() {
+        let mut backoff = RestartBackoff::new();
+        let just_under = ENGINE_STABLE_UPTIME - Duration::from_millis(1);
+
+        match backoff.on_child_exit(just_under) {
+            EngineExitAction::SleepThenRespawn(delay) => assert_eq!(delay, Duration::from_secs(1)),
+            EngineExitAction::RespawnNow => {
+                panic!("an engine that dies just before the threshold must back off")
+            }
+        }
+        assert_eq!(backoff.delay(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn failed_spawn_advances_the_same_delay_series() {
+        let mut backoff = RestartBackoff::new();
+
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(1));
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(2));
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn spawn_failures_and_early_exits_share_one_delay_series() {
+        let mut backoff = RestartBackoff::new();
+
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(1));
+        match backoff.on_child_exit(crashing()) {
+            EngineExitAction::SleepThenRespawn(delay) => assert_eq!(delay, Duration::from_secs(2)),
+            EngineExitAction::RespawnNow => panic!("a crash must not be respawned immediately"),
+        }
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn stable_run_after_spawn_failures_resets_the_delay() {
+        let mut backoff = RestartBackoff::new();
+        backoff.on_spawn_failure();
+        backoff.on_spawn_failure();
+
+        assert_eq!(
+            backoff.on_child_exit(stable()),
+            EngineExitAction::RespawnNow
+        );
+        assert_eq!(backoff.on_spawn_failure(), Duration::from_secs(1));
     }
 }
