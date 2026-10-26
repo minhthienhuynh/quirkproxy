@@ -283,17 +283,47 @@ async fn main() -> Result<()> {
     }
 
     // 5. Build Axum reverse proxy router
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrency));
+
     let state = AppState {
         config: config.clone(),
         warp: warp.clone(),
         http_client: http_client.clone(),
+        semaphore,
+    };
+
+    let cors = match config.cors_allowed_origins.as_deref() {
+        Some("*") => {
+            warn!("CORS is configured to allow all origins (*)");
+            CorsLayer::permissive()
+        }
+        Some(origins) if !origins.trim().is_empty() => {
+            let parsed: Vec<_> = origins
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(parsed)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+        }
+        _ => CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+                let s = origin.to_str().unwrap_or_default();
+                s.starts_with("http://localhost")
+                    || s.starts_with("http://127.0.0.1")
+                    || s.starts_with("https://localhost")
+                    || s.starts_with("https://127.0.0.1")
+            }))
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any),
     };
 
     let app = Router::new()
         .route("/healthz", get(proxy::healthz))
         .route("/v1/rotate", post(proxy::trigger_rotate))
         .fallback(proxy::proxy_handler)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
