@@ -58,22 +58,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 1. Install wgcf (WARP identity) and wireproxy (userspace WireGuard -> SOCKS5)
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
-         amd64) WG_ARCH=amd64; WP_ARCH=amd64 ;; \
-         arm64) WG_ARCH=arm64; WP_ARCH=arm64 ;; \
+         amd64) \
+           WG_ARCH=amd64; WP_ARCH=amd64; \
+           WGCF_SHA256="4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8"; \
+           WP_SHA256="e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" ;; \
+         arm64) \
+           WG_ARCH=arm64; WP_ARCH=arm64; \
+           WGCF_SHA256="710ab2d8ac145d81a4cf0c11bdb0e05914f77ae2a45f67b87e718d84b4cb7301"; \
+           WP_SHA256="370e00bd2167960d1ecd1c3c1439715bbaa94a0a110a2040468670c9af6021b6" ;; \
          *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
        esac \
     && curl -fsSL -o /usr/local/bin/wgcf \
         "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${WG_ARCH}" \
+    && echo "${WGCF_SHA256}  /usr/local/bin/wgcf" | sha256sum -c - \
     && curl -fsSL -o /tmp/wireproxy.tar.gz \
         "https://github.com/windtf/wireproxy/releases/download/${WIREPROXY_VERSION}/wireproxy_linux_${WP_ARCH}.tar.gz" \
+    && echo "${WP_SHA256}  /tmp/wireproxy.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
     && rm -f /tmp/wireproxy.tar.gz \
     && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy
 
 # 2. Download official opencode2api release binary
 RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) OPENCODE_SHA256="62f492c94acf935e570a823fdafc5c86d068a35486f945377099c917dc981256" ;; \
+         arm64) OPENCODE_SHA256="c0cdfd8604f66742f9309b425a2b2467970961ac811327638a09c74b4a930a08" ;; \
+         *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+       esac \
     && echo "Downloading opencode2api ${OPENCODE2API_VERSION} for ${ARCH}..." \
-    && curl -fsSL "https://github.com/jasonxu114514/opencode2api/releases/download/${OPENCODE2API_VERSION}/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}.tar.gz" | tar -xz -C /tmp \
+    && curl -fsSL -o /tmp/opencode2api.tar.gz "https://github.com/jasonxu114514/opencode2api/releases/download/${OPENCODE2API_VERSION}/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}.tar.gz" \
+    && echo "${OPENCODE_SHA256}  /tmp/opencode2api.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/opencode2api.tar.gz -C /tmp \
     && mv /tmp/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}/opencode2api /usr/local/bin/opencode2api \
     && chmod +x /usr/local/bin/opencode2api \
     && rm -rf /tmp/opencode2api*

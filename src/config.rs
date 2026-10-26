@@ -51,6 +51,10 @@ pub struct Config {
     pub opencode2api_config: String,
     /// Local gateway server key
     pub server_key: String,
+    /// Max concurrent incoming requests processed simultaneously (default: 64)
+    pub max_concurrency: usize,
+    /// Optional allowed CORS origins (default: localhost/127.0.0.1)
+    pub cors_allowed_origins: Option<String>,
 }
 
 impl Config {
@@ -82,6 +86,13 @@ impl Config {
         // supervisor retry is the only retry there.
         let default_max_retries = if warp_identities > 1 { 1 } else { 3 };
 
+        let server_key = env::var("SERVER_KEY").unwrap_or_else(|_| "local-test-key".to_string());
+        if server_key == "local-test-key" || server_key.trim().is_empty() {
+            tracing::warn!(
+                "SECURITY WARNING: Running with default or empty SERVER_KEY! Configure a secure SERVER_KEY in production."
+            );
+        }
+
         Self {
             host,
             port,
@@ -98,7 +109,9 @@ impl Config {
                 .unwrap_or_else(|_| "/usr/local/bin/opencode2api".to_string()),
             opencode2api_config: env::var("OPENCODE2API_CONFIG")
                 .unwrap_or_else(|_| "/app/config.json".to_string()),
-            server_key: env::var("SERVER_KEY").unwrap_or_else(|_| "local-test-key".to_string()),
+            server_key,
+            max_concurrency: env_parse("MAX_CONCURRENCY", 64).max(1),
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").ok(),
         }
     }
 
@@ -145,6 +158,8 @@ mod tests {
             opencode2api_bin: "opencode2api".into(),
             opencode2api_config: "/app/config.json".into(),
             server_key: "k".into(),
+            max_concurrency: 64,
+            cors_allowed_origins: None,
         };
         assert_eq!(cfg.tunnel_port(0), 40001);
         assert_eq!(cfg.tunnel_port(2), 40003);

@@ -25,6 +25,7 @@ pub struct AppState {
     pub config: Config,
     pub warp: Arc<WarpPool>,
     pub http_client: reqwest::Client,
+    pub semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[inline]
@@ -113,7 +114,7 @@ struct EngineHealth {
 /// for every input.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
         return false;
     }
     let mut diff = 0u8;
@@ -145,7 +146,10 @@ pub async fn trigger_rotate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
 
-    if !constant_time_eq(provided, &state.config.server_key) {
+    if state.config.server_key.trim().is_empty()
+        || provided.trim().is_empty()
+        || !constant_time_eq(provided, &state.config.server_key)
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -217,6 +221,27 @@ fn make_session_id() -> String {
 }
 
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
+    let permit = match state.semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(
+                "Concurrency limit reached ({}), rejecting incoming request",
+                state.config.max_concurrency
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({
+                    "error": {
+                        "message": "Too many concurrent requests; server concurrency limit reached",
+                        "type": "concurrency_limit_exceeded"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path_and_query = uri
@@ -425,10 +450,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         // until the last byte reaches the client, not just until headers arrive.
         let stream = res.bytes_stream();
         let body = match inflight.take() {
-            Some(guard) => Body::from_stream(StreamGuard::new(guard, stream)),
+            Some(guard) => Body::from_stream(StreamGuard::new(guard, permit, stream)),
             // Unreachable in practice: the guard is taken exactly once per
             // request, on the path that returns a response body.
-            None => Body::from_stream(stream),
+            None => {
+                drop(permit);
+                Body::from_stream(stream)
+            }
         };
 
         return build_response(status, &res_headers, body);
@@ -459,13 +487,19 @@ fn build_response(status: StatusCode, headers: &HeaderMap, body: Body) -> Respon
 /// panic) releases the guard too, so the counter cannot leak.
 struct StreamGuard<S> {
     _guard: crate::warp::InflightGuard,
+    _permit: tokio::sync::OwnedSemaphorePermit,
     inner: S,
 }
 
 impl<S> StreamGuard<S> {
-    fn new(guard: crate::warp::InflightGuard, inner: S) -> Self {
+    fn new(
+        guard: crate::warp::InflightGuard,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        inner: S,
+    ) -> Self {
         Self {
             _guard: guard,
+            _permit: permit,
             inner,
         }
     }
@@ -497,7 +531,8 @@ mod tests {
         assert!(!constant_time_eq("local-test-key", "local-test-kex"));
         assert!(!constant_time_eq("local-test-key", "local-test-ke"));
         assert!(!constant_time_eq("local-test-key", ""));
-        assert!(constant_time_eq("", ""));
+        assert!(!constant_time_eq("", "local-test-key"));
+        assert!(!constant_time_eq("", ""));
     }
 
     #[tokio::test]
@@ -521,5 +556,47 @@ mod tests {
                 .is_some(),
             "expected a length limit error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_with_429_when_saturated() {
+        let cfg = Config {
+            host: "0.0.0.0".into(),
+            port: 8080,
+            opencode_api_port: 18088,
+            upstream_api: "http://127.0.0.1:18088".into(),
+            warp_base_socks_port: 40001,
+            warp_identities: 1,
+            warp_enabled: false,
+            warp_auto_rotate_429: false,
+            warp_auto_rotate_403: false,
+            warp_state_dir: "/tmp".into(),
+            max_retries: 1,
+            opencode2api_bin: "false".into(),
+            opencode2api_config: "/tmp/cfg.json".into(),
+            server_key: "test-key".into(),
+            max_concurrency: 1,
+            cors_allowed_origins: None,
+        };
+        let pool = Arc::new(WarpPool::new([40001], "/tmp", false));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        // Exhaust the 1 available permit
+        let _permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        let state = AppState {
+            config: cfg,
+            warp: pool,
+            http_client: reqwest::Client::new(),
+            semaphore,
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = proxy_handler(State(state), req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
