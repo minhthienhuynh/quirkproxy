@@ -71,7 +71,7 @@ impl Config {
 
         // WARP_IDENTITIES=0 is a deliberate "no tunnels" switch, so it must not
         // fall back to the default the way a missing variable would.
-        let warp_identities = env_parse::<usize>("WARP_IDENTITIES", 3);
+        let warp_identities = env_parse::<usize>("WARP_IDENTITIES", 5);
 
         // The engine builds one anonymous node per pool entry and hops
         // between them on its own retries. A supervisor-level retry on top of
