@@ -313,7 +313,7 @@ impl Tunnel {
             // keeps the map from growing over a long wait.
             first_seen.retain(|inode, _| current.contains(inode));
 
-            let streams = if now.duration_since(started) < stream_min_age {
+            let streams = if !current.is_empty() && now.duration_since(started) < stream_min_age {
                 // Still observing: an old stream looks new right now.
                 1
             } else {
@@ -601,6 +601,7 @@ impl Tunnel {
     }
 
     async fn status(&self) -> TunnelStatus {
+        let connections = self.active_connections();
         let st = self.state.lock().await;
         TunnelStatus {
             index: self.index,
@@ -608,7 +609,7 @@ impl Tunnel {
             ip: st.ip.clone(),
             healthy: st.healthy,
             recycling: self.recycling.load(Ordering::Relaxed),
-            connections: self.active_connections(),
+            connections,
         }
     }
 }
@@ -883,7 +884,7 @@ impl WarpPool {
 
         for _ in 0..n {
             let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
-            let t = &self.tunnels[start % n];
+            let t = &self.tunnels[start];
             if t.recycling.load(Ordering::Relaxed) {
                 continue;
             }
@@ -908,7 +909,7 @@ impl WarpPool {
             }
             // Busy, but keep the least busy one as the fallback.
             let better = match &fallback {
-                Some((_, current)) => busy < current.active_connections(),
+                Some((current_busy, _)) => busy < *current_busy,
                 None => true,
             };
             if better {
@@ -1241,7 +1242,7 @@ fn chrono_now() -> String {
     format!("{}", now)
 }
 
-async fn wait_for_shutdown(shutdown: &Arc<AtomicBool>) {
+pub(crate) async fn wait_for_shutdown(shutdown: &Arc<AtomicBool>) {
     while !shutdown.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

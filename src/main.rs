@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use config::Config;
 use proxy::AppState;
-use warp::WarpPool;
+use warp::{wait_for_shutdown, WarpPool};
 
 /// How long to wait for the engine to answer /healthz after spawning it.
 /// The engine returns 503 until its model catalog refresh succeeds, which
@@ -201,12 +201,6 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
                 return;
             }
         }
-    }
-}
-
-async fn wait_for_shutdown(shutdown: &Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
