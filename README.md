@@ -1,4 +1,4 @@
-# QuirkProxy v1.2.3
+# QuirkProxy v1.2.4
 
 Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2API** with a **multi-identity Cloudflare WARP egress pool**.
 
