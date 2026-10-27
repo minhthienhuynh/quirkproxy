@@ -224,6 +224,7 @@ async fn main() -> Result<()> {
         tunnel_ports,
         &config.warp_state_dir,
         config.warp_enabled,
+        config.warp_protocol,
     ));
 
     let shutdown = Arc::new(AtomicBool::new(false));

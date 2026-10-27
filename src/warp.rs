@@ -21,6 +21,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use crate::config::WarpProtocol;
+
 /// Don't recycle the same tunnel twice inside this window. Re-registering
 /// costs a WARP round-trip and briefly drops the tunnel, so a burst of 429s
 /// must not turn into a registration storm.
@@ -97,6 +99,7 @@ pub struct TunnelStatus {
 pub struct WarpStatus {
     pub enabled: bool,
     pub running: bool,
+    pub protocol: WarpProtocol,
     pub identities: usize,
     /// Number of tunnels whose last egress probe succeeded. `running` is true
     /// when at least one tunnel works; a partially-up pool is normal during
@@ -160,6 +163,7 @@ pub struct Tunnel {
     port: u16,
     dir: PathBuf,
     conf_path: PathBuf,
+    protocol: WarpProtocol,
     state: Mutex<TunnelState>,
     /// Number of egress probes this supervisor is running against the tunnel
     /// right now.
@@ -343,34 +347,57 @@ impl Tunnel {
         }
     }
 
-    /// Re-registers a fresh WARP identity and rewrites the wireproxy config.
+    /// Re-registers a fresh WARP identity and rewrites the tunnel config.
     /// The running child is not touched here; its supervisor restarts it.
     async fn re_register(&self) -> Result<()> {
-        // `wgcf register` refuses to overwrite an existing account
-        // ("existing account detected"), so the previous identity files must
-        // be removed or a recycle silently keeps the burned egress.
-        for stale in ["wgcf-account.toml", "wgcf-profile.conf"] {
-            let path = self.dir.join(stale);
-            if path.exists() {
-                tokio::fs::remove_file(&path).await.with_context(|| {
-                    format!("failed to remove stale identity file {}", path.display())
-                })?;
+        match self.protocol {
+            WarpProtocol::WireGuard => {
+                // `wgcf register` refuses to overwrite an existing account
+                // ("existing account detected"), so the previous identity files must
+                // be removed or a recycle silently keeps the burned egress.
+                for stale in ["wgcf-account.toml", "wgcf-profile.conf"] {
+                    let path = self.dir.join(stale);
+                    if path.exists() {
+                        tokio::fs::remove_file(&path).await.with_context(|| {
+                            format!("failed to remove stale identity file {}", path.display())
+                        })?;
+                    }
+                }
+
+                self.run_tool("wgcf", &["register", "--accept-tos"]).await?;
+                self.run_tool("wgcf", &["generate"]).await?;
+
+                self.write_conf()
+            }
+            WarpProtocol::Masque => {
+                let config_file = self.dir.join("config.json");
+                if config_file.exists() {
+                    tokio::fs::remove_file(&config_file)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove stale identity file {}",
+                                config_file.display()
+                            )
+                        })?;
+                }
+
+                self.run_tool(
+                    "usque",
+                    &["register", "-a", "-c", &self.conf_path.to_string_lossy()],
+                )
+                .await
             }
         }
-
-        self.run_wgcf(&["register", "--accept-tos"]).await?;
-        self.run_wgcf(&["generate"]).await?;
-
-        self.write_conf()
     }
 
-    /// Runs one `wgcf` subcommand inside this tunnel's identity directory with
+    /// Runs one CLI subcommand inside this tunnel's identity directory with
     /// a hard timeout. Both callers hold `recycle_lock`, so a wedged child must
     /// not be able to block the pool indefinitely.
-    async fn run_wgcf(&self, args: &[&str]) -> Result<()> {
-        let label = args.first().copied().unwrap_or("wgcf");
+    async fn run_tool(&self, bin: &str, args: &[&str]) -> Result<()> {
+        let label = args.first().copied().unwrap_or(bin);
 
-        let child = Command::new("wgcf")
+        let child = Command::new(bin)
             .args(args)
             .current_dir(&self.dir)
             .stdout(Stdio::null())
@@ -382,11 +409,12 @@ impl Tunnel {
         let output = match tokio::time::timeout(WGCF_TIMEOUT, child).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
-                return Err(e).with_context(|| format!("failed to execute wgcf {}", label))
+                return Err(e).with_context(|| format!("failed to execute {} {}", bin, label))
             }
             Err(_) => {
                 anyhow::bail!(
-                    "wgcf {} timed out after {:?} (tunnel {})",
+                    "{} {} timed out after {:?} (tunnel {})",
+                    bin,
                     label,
                     WGCF_TIMEOUT,
                     self.index
@@ -396,7 +424,8 @@ impl Tunnel {
 
         if !output.status.success() {
             anyhow::bail!(
-                "wgcf {} failed: {}",
+                "{} {} failed: {}",
+                bin,
                 label,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
@@ -405,21 +434,34 @@ impl Tunnel {
         Ok(())
     }
 
-    /// Ensures an identity exists on first boot, then writes the wireproxy
+    /// Ensures an identity exists on first boot, then writes the tunnel
     /// config. A re-registration on boot would rotate the IP on every restart,
     /// so an existing profile is reused as-is.
     async fn ensure_identity(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.dir).await.ok();
 
-        let profile = self.dir.join("wgcf-profile.conf");
-        if !profile.exists() {
-            info!(
-                "Tunnel {}: no WARP identity yet, registering...",
-                self.index
-            );
-            self.re_register().await?;
-        } else {
-            self.write_conf()?;
+        match self.protocol {
+            WarpProtocol::WireGuard => {
+                let profile = self.dir.join("wgcf-profile.conf");
+                if !profile.exists() {
+                    info!(
+                        "Tunnel {}: no WARP WireGuard identity yet, registering...",
+                        self.index
+                    );
+                    self.re_register().await?;
+                } else {
+                    self.write_conf()?;
+                }
+            }
+            WarpProtocol::Masque => {
+                if !self.conf_path.exists() {
+                    info!(
+                        "Tunnel {}: no WARP MASQUE identity yet, registering...",
+                        self.index
+                    );
+                    self.re_register().await?;
+                }
+            }
         }
         Ok(())
     }
@@ -495,27 +537,48 @@ impl Tunnel {
         }
     }
 
-    /// Runs `wireproxy` for this tunnel, restarting it with backoff whenever it
+    /// Runs `wireproxy` or `usque` for this tunnel, restarting it with backoff whenever it
     /// exits unexpectedly, or immediately when a recycle asks for it through
     /// [`Tunnel::restart`]. This task owns the child handle, so restarting goes
     /// through it rather than through the process table.
     async fn supervise(self: &Arc<Self>, shutdown: Arc<AtomicBool>) {
         let mut backoff = Duration::from_secs(1);
+        let daemon_name = match self.protocol {
+            WarpProtocol::WireGuard => "wireproxy",
+            WarpProtocol::Masque => "usque",
+        };
 
         while !shutdown.load(Ordering::Relaxed) {
-            let child = Command::new("wireproxy")
-                .args(["-c", &self.conf_path.to_string_lossy()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn();
+            let port_str = self.port.to_string();
+            let child = match self.protocol {
+                WarpProtocol::WireGuard => Command::new("wireproxy")
+                    .args(["-c", &self.conf_path.to_string_lossy()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn(),
+                WarpProtocol::Masque => Command::new("usque")
+                    .args([
+                        "socks",
+                        "-b",
+                        "127.0.0.1",
+                        "-p",
+                        &port_str,
+                        "-c",
+                        &self.conf_path.to_string_lossy(),
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn(),
+            };
 
             let mut child = match child {
                 Ok(c) => c,
                 Err(e) => {
                     error!(
-                        "Tunnel {}: failed to spawn wireproxy: {}. Retrying in {:?}",
-                        self.index, e, backoff
+                        "Tunnel {}: failed to spawn {}: {}. Retrying in {:?}",
+                        self.index, daemon_name, e, backoff
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(TUNNEL_MAX_BACKOFF);
@@ -552,8 +615,8 @@ impl Tunnel {
                 status = child.wait() => {
                     let uptime = started.elapsed();
                     warn!(
-                        "Tunnel {}: wireproxy exited ({:?}) after {:?}",
-                        self.index, status, uptime
+                        "Tunnel {}: {} exited ({:?}) after {:?}",
+                        self.index, daemon_name, status, uptime
                     );
                     cancelled.store(true, Ordering::Relaxed);
                     self.state.lock().await.healthy = false;
@@ -563,7 +626,7 @@ impl Tunnel {
                     }
                 }
                 _ = self.restart.notified() => {
-                    info!("Tunnel {}: restart requested, stopping wireproxy...", self.index);
+                    info!("Tunnel {}: restart requested, stopping {}...", self.index, daemon_name);
                     cancelled.store(true, Ordering::Relaxed);
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -617,6 +680,7 @@ impl Tunnel {
 pub struct WarpPool {
     tunnels: Vec<Arc<Tunnel>>,
     enabled: bool,
+    pub protocol: WarpProtocol,
     /// Round-robin cursor for picking which tunnel to recycle.
     cursor: AtomicUsize,
     /// Global count of streams currently riding any tunnel.
@@ -633,6 +697,7 @@ impl WarpPool {
         tunnel_ports: impl IntoIterator<Item = u16>,
         state_dir: &str,
         enabled: bool,
+        protocol: WarpProtocol,
     ) -> Self {
         let base = PathBuf::from(state_dir);
         let tunnels = tunnel_ports
@@ -640,12 +705,17 @@ impl WarpPool {
             .enumerate()
             .map(|(index, port)| {
                 let dir = base.join(format!("id{}", index + 1));
+                let conf_path = match protocol {
+                    WarpProtocol::WireGuard => dir.join("wireproxy.conf"),
+                    WarpProtocol::Masque => dir.join("config.json"),
+                };
                 let probe = build_probe_client(port);
                 Arc::new(Tunnel {
                     index,
                     port,
-                    conf_path: dir.join("wireproxy.conf"),
                     dir,
+                    conf_path,
+                    protocol,
                     state: Mutex::new(TunnelState {
                         ip: None,
                         last_recycle: Instant::now() - RECYCLE_COOLDOWN,
@@ -665,6 +735,7 @@ impl WarpPool {
         Self {
             tunnels,
             enabled,
+            protocol,
             cursor: AtomicUsize::new(0),
             inflight: Arc::new(AtomicUsize::new(0)),
             recycle_lock: Mutex::new(()),
@@ -1123,6 +1194,7 @@ impl WarpPool {
         WarpStatus {
             enabled: self.enabled(),
             running: tunnels.iter().any(|t| t.healthy),
+            protocol: self.protocol,
             identities: tunnels.len(),
             healthy: tunnels.iter().filter(|t| t.healthy).count(),
             proxy_urls: if self.enabled() {
@@ -1287,6 +1359,7 @@ mod tests {
             (0..n).map(|i| 40001 + i as u16),
             "/tmp/quirkproxy-test-warp",
             true,
+            WarpProtocol::WireGuard,
         ))
     }
 
@@ -1387,6 +1460,7 @@ mod tests {
             (0..3).map(|i| 40001 + i as u16),
             "/tmp/quirkproxy-test-warp",
             false,
+            WarpProtocol::WireGuard,
         ));
         assert!(!pool.enabled());
         // The engine config is built from the pool's proxy URLs. With the pool
@@ -1401,6 +1475,7 @@ mod tests {
             (0..3).map(|i| 40001 + i as u16),
             "/tmp/quirkproxy-test-warp",
             false,
+            WarpProtocol::WireGuard,
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
         let handles = pool.start(shutdown).await;
@@ -1578,7 +1653,12 @@ mod tests {
             .expect("connect should succeed");
         let _accepted = listener.accept().await.expect("accept should succeed");
 
-        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let pool = Arc::new(WarpPool::new(
+            [port],
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        ));
         let tunnel = pool.tunnels[0].clone();
 
         let ours = established_sockets_on_port(port)
@@ -1602,7 +1682,12 @@ mod tests {
             .expect("connect should succeed");
         let (accepted, _) = listener.accept().await.expect("accept should succeed");
 
-        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let pool = Arc::new(WarpPool::new(
+            [port],
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        ));
         let tunnel = pool.tunnels[0].clone();
 
         // A stream that is still open when the wait expires must not be
@@ -1647,7 +1732,12 @@ mod tests {
             .expect("connect should succeed");
         let (accepted, _) = listener.accept().await.expect("accept should succeed");
 
-        let pool = Arc::new(WarpPool::new([port], "/tmp/quirkproxy-test-warp", true));
+        let pool = Arc::new(WarpPool::new(
+            [port],
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        ));
         let tunnel = pool.tunnels[0].clone();
         assert!(tunnel.active_connections() > 0);
 
@@ -1672,5 +1762,29 @@ mod tests {
             drain.await.expect("drain task should not panic"),
             "a request that finishes during the wait must not hold the swap back"
         );
+    }
+
+    #[test]
+    fn masque_pool_config_path_points_to_config_json() {
+        let pool = WarpPool::new(
+            [40001],
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::Masque,
+        );
+        assert_eq!(pool.protocol, WarpProtocol::Masque);
+        assert!(pool.tunnels[0].conf_path.ends_with("config.json"));
+    }
+
+    #[test]
+    fn wireguard_pool_config_path_points_to_wireproxy_conf() {
+        let pool = WarpPool::new(
+            [40001],
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        );
+        assert_eq!(pool.protocol, WarpProtocol::WireGuard);
+        assert!(pool.tunnels[0].conf_path.ends_with("wireproxy.conf"));
     }
 }

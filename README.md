@@ -54,6 +54,7 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
 | `WARP_IDENTITIES` | `5` | Number of parallel WARP identities. `0` disables the pool. |
+| `WARP_PROTOCOL` | `wireguard` | Tunnel egress protocol: `wireguard` (userspace `wireproxy`) or `masque` (HTTP/3 Connect-IP `usque`) |
 | `WARP_BASE_SOCKS_PORT` | `40001` | First SOCKS5 port of the pool |
 | `WARP_STATE_DIR` | `/app/warp` | Where per-identity WireGuard profiles are stored |
 | `WARP_AUTO_ROTATE_429` | `true` | Recycle a tunnel on upstream `429` |
