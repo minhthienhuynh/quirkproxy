@@ -39,6 +39,7 @@ ENV WARP_ENABLED=true
 ENV WARP_BASE_SOCKS_PORT=40001
 ENV WARP_IDENTITIES=3
 ENV WARP_STATE_DIR=/app/warp
+ENV WARP_PROTOCOL=wireguard
 ENV WARP_AUTO_ROTATE_429=true
 ENV WARP_AUTO_ROTATE_403=true
 ENV OPENCODE2API_BIN=/usr/local/bin/opencode2api
@@ -46,13 +47,15 @@ ENV OPENCODE2API_CONFIG=/app/config.json
 ENV OPENCODE2API_VERSION=v1.4.4
 ENV WGCF_VERSION=v2.3.1
 ENV WIREPROXY_VERSION=v1.1.3
+ENV USQUE_VERSION=v4.2.1
 
-# Runtime deps only: wireproxy is userspace WireGuard, so no tun device,
+# Runtime deps only: wireproxy and usque are userspace tools, so no tun device,
 # no NET_ADMIN and no dbus/warp-svc daemon are needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     procps \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Install wgcf (WARP identity) and wireproxy (userspace WireGuard -> SOCKS5)
@@ -78,7 +81,22 @@ RUN ARCH=$(dpkg --print-architecture) \
     && rm -f /tmp/wireproxy.tar.gz \
     && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy
 
-# 2. Download official opencode2api release binary
+# 2. Install usque (Cloudflare WARP via MASQUE HTTP/3 protocol)
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) USQUE_SHA256="4117e20695078af9c11edecd1a826c009bbc7ea0b7f64458612b4198910bc313" ;; \
+         arm64) USQUE_SHA256="c88b061c2a567f30813d7505637d1fb6fe7ec5898b5b61fd05122409fa5ad925" ;; \
+         *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/usque.zip \
+        "https://github.com/Diniboy1123/usque/releases/download/${USQUE_VERSION}/usque_${USQUE_VERSION#v}_linux_${ARCH}.zip" \
+    && echo "${USQUE_SHA256}  /tmp/usque.zip" | sha256sum -c - \
+    && unzip -q -o /tmp/usque.zip -d /tmp \
+    && mv /tmp/usque /usr/local/bin/usque \
+    && chmod +x /usr/local/bin/usque \
+    && rm -rf /tmp/usque*
+
+# 3. Download official opencode2api release binary
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
          amd64) OPENCODE_SHA256="62f492c94acf935e570a823fdafc5c86d068a35486f945377099c917dc981256" ;; \

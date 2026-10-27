@@ -1,4 +1,22 @@
+use serde::{Deserialize, Serialize};
 use std::env;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarpProtocol {
+    #[default]
+    WireGuard,
+    Masque,
+}
+
+impl std::fmt::Display for WarpProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WireGuard => write!(f, "wireguard"),
+            Self::Masque => write!(f, "masque"),
+        }
+    }
+}
 
 /// Reads a boolean env var, accepting `1/true/yes/on` (case-insensitive).
 fn env_bool(key: &str, default: bool) -> bool {
@@ -37,6 +55,8 @@ pub struct Config {
     pub warp_identities: usize,
     /// Whether Cloudflare WARP tunnels are enabled (default: true)
     pub warp_enabled: bool,
+    /// Egress tunnel protocol: WireGuard (default) or Masque (HTTP/3)
+    pub warp_protocol: WarpProtocol,
     /// Auto-rotate a WARP identity when receiving HTTP 429 Rate Limit (default: true)
     pub warp_auto_rotate_429: bool,
     /// Auto-rotate a WARP identity when receiving HTTP 403 Abuse / FreeTierError (default: true)
@@ -93,6 +113,16 @@ impl Config {
             );
         }
 
+        let warp_protocol = match env::var("WARP_PROTOCOL")
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+            .as_str()
+        {
+            "masque" | "usque" => WarpProtocol::Masque,
+            _ => WarpProtocol::WireGuard,
+        };
+
         Self {
             host,
             port,
@@ -101,6 +131,7 @@ impl Config {
             warp_base_socks_port: env_parse("WARP_BASE_SOCKS_PORT", 40001),
             warp_identities,
             warp_enabled: env_bool("WARP_ENABLED", true) && warp_identities > 0,
+            warp_protocol,
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
             warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
@@ -151,6 +182,7 @@ mod tests {
             warp_base_socks_port: 40001,
             warp_identities: 3,
             warp_enabled: true,
+            warp_protocol: WarpProtocol::WireGuard,
             warp_auto_rotate_429: true,
             warp_auto_rotate_403: true,
             warp_state_dir: "/app/warp".into(),
@@ -189,5 +221,20 @@ mod tests {
         // listens on: with WARP disabled every upstream call would fail with
         // `proxy_error` instead of going out directly.
         assert!(cfg.proxy_urls().is_empty());
+    }
+
+    #[test]
+    fn warp_protocol_parses_wireguard_and_masque() {
+        std::env::set_var("WARP_PROTOCOL", "masque");
+        assert_eq!(Config::from_env().warp_protocol, WarpProtocol::Masque);
+
+        std::env::set_var("WARP_PROTOCOL", "usque");
+        assert_eq!(Config::from_env().warp_protocol, WarpProtocol::Masque);
+
+        std::env::set_var("WARP_PROTOCOL", "wireguard");
+        assert_eq!(Config::from_env().warp_protocol, WarpProtocol::WireGuard);
+
+        std::env::remove_var("WARP_PROTOCOL");
+        assert_eq!(Config::from_env().warp_protocol, WarpProtocol::WireGuard);
     }
 }

@@ -568,6 +568,7 @@ mod tests {
             warp_base_socks_port: 40001,
             warp_identities: 1,
             warp_enabled: false,
+            warp_protocol: crate::config::WarpProtocol::WireGuard,
             warp_auto_rotate_429: false,
             warp_auto_rotate_403: false,
             warp_state_dir: "/tmp".into(),
@@ -578,7 +579,12 @@ mod tests {
             max_concurrency: 1,
             cors_allowed_origins: None,
         };
-        let pool = Arc::new(WarpPool::new([40001], "/tmp", false));
+        let pool = Arc::new(WarpPool::new(
+            [40001],
+            "/tmp",
+            false,
+            crate::config::WarpProtocol::WireGuard,
+        ));
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         // Exhaust the 1 available permit
         let _permit = semaphore.clone().try_acquire_owned().unwrap();
