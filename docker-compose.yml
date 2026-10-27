@@ -15,6 +15,7 @@ services:
       - WARP_IDENTITIES=${WARP_IDENTITIES:-5}
       - WARP_BASE_SOCKS_PORT=${WARP_BASE_SOCKS_PORT:-40001}
       - WARP_STATE_DIR=${WARP_STATE_DIR:-/app/warp}
+      - WARP_PROTOCOL=${WARP_PROTOCOL:-wireguard}
       - WARP_AUTO_ROTATE_429=${WARP_AUTO_ROTATE_429:-true}
       - WARP_AUTO_ROTATE_403=${WARP_AUTO_ROTATE_403:-true}
       # With a multi-node pool the engine hops between the proxies itself, so
