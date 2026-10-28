@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: quirkproxy:v1.3
+    image: quirkproxy:v2.0
     container_name: quirkproxy
     restart: unless-stopped
     environment:

@@ -65,9 +65,11 @@ pub struct Config {
     pub warp_state_dir: String,
     /// Max retry attempts after IP rotation (default: 3)
     pub max_retries: usize,
-    /// Binary path for opencode2api
+    /// Binary path for engine (bun)
     pub opencode2api_bin: String,
-    /// Config path for opencode2api
+    /// Script path for zen-proxy
+    pub opencode2api_script: String,
+    /// Config path for engine
     pub opencode2api_config: String,
     /// Local gateway server key
     pub server_key: String,
@@ -136,34 +138,32 @@ impl Config {
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
             warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
             max_retries: env_parse("MAX_RETRIES", default_max_retries).max(1),
-            opencode2api_bin: env::var("OPENCODE2API_BIN")
-                .unwrap_or_else(|_| "/usr/local/bin/opencode2api".to_string()),
-            opencode2api_config: env::var("OPENCODE2API_CONFIG")
-                .unwrap_or_else(|_| "/app/config.json".to_string()),
+            opencode2api_bin: env::var("ENGINE_BIN")
+                .or_else(|_| env::var("OPENCODE2API_BIN"))
+                .unwrap_or_else(|_| "bun".to_string()),
+            opencode2api_script: env::var("ENGINE_SCRIPT")
+                .unwrap_or_else(|_| "/app/engine/zen-proxy.mjs".to_string()),
+            opencode2api_config: env::var("ENGINE_CONFIG")
+                .or_else(|_| env::var("OPENCODE2API_CONFIG"))
+                .unwrap_or_else(|_| "/app/zen-proxy.json".to_string()),
             server_key,
             max_concurrency: env_parse("MAX_CONCURRENCY", 64).max(1),
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").ok(),
         }
     }
 
-    /// SOCKS5 port for tunnel `index` (0-based).
+    /// Port for tunnel `index` (0-based).
     pub fn tunnel_port(&self, index: usize) -> u16 {
         self.warp_base_socks_port + index as u16
     }
 
-    /// Every SOCKS5 proxy URL, in the `#pool` form the engine understands.
-    ///
-    /// The list is empty when the pool is disabled: the engine then talks to
-    /// the upstream directly. Handing it dead SOCKS endpoints instead makes
-    /// every upstream call fail with `proxy_error`, because the engine keeps
-    /// routing through the configured proxies no matter how many of them
-    /// refuse the connection.
+    /// Every HTTP proxy URL for the engine pool.
     pub fn proxy_urls(&self) -> Vec<String> {
         if !self.warp_enabled || self.warp_identities == 0 {
             return Vec::new();
         }
         (0..self.warp_identities)
-            .map(|i| format!("socks5://127.0.0.1:{}#pool", self.tunnel_port(i)))
+            .map(|i| format!("http://127.0.0.1:{}", self.tunnel_port(i)))
             .collect()
     }
 }
@@ -187,8 +187,9 @@ mod tests {
             warp_auto_rotate_403: true,
             warp_state_dir: "/app/warp".into(),
             max_retries: 3,
-            opencode2api_bin: "opencode2api".into(),
-            opencode2api_config: "/app/config.json".into(),
+            opencode2api_bin: "bun".into(),
+            opencode2api_script: "/app/engine/zen-proxy.mjs".into(),
+            opencode2api_config: "/app/zen-proxy.json".into(),
             server_key: "k".into(),
             max_concurrency: 64,
             cors_allowed_origins: None,
@@ -198,9 +199,9 @@ mod tests {
         assert_eq!(
             cfg.proxy_urls(),
             vec![
-                "socks5://127.0.0.1:40001#pool",
-                "socks5://127.0.0.1:40002#pool",
-                "socks5://127.0.0.1:40003#pool",
+                "http://127.0.0.1:40001",
+                "http://127.0.0.1:40002",
+                "http://127.0.0.1:40003",
             ]
         );
     }
