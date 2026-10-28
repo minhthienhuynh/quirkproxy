@@ -222,29 +222,21 @@ pub struct Tunnel {
 
 impl Tunnel {
     fn proxy_url(&self) -> String {
-        format!("socks5://127.0.0.1:{}", self.port)
+        format!("http://127.0.0.1:{}", self.port)
     }
 
     /// Builds the wireproxy config from a freshly generated wgcf profile.
-    ///
-    /// The `DNS` line is dropped on purpose: wireproxy would otherwise answer
-    /// DNS locally, bypassing the tunnel. The engine sends the hostname itself
-    /// inside the SOCKS5 CONNECT, so name resolution happens at the Cloudflare
-    /// exit and cannot leak around the tunnel.
     fn write_conf(&self) -> Result<()> {
         let profile = std::fs::read_to_string(self.dir.join("wgcf-profile.conf"))
             .context("wgcf-profile.conf missing; run wgcf generate first")?;
 
         let mut conf = String::with_capacity(profile.len() + 64);
         for line in profile.lines() {
-            if line.trim_start().starts_with("DNS") {
-                continue;
-            }
             conf.push_str(line);
             conf.push('\n');
         }
         conf.push_str(&format!(
-            "\n[Socks5]\nBindAddress = 127.0.0.1:{}\n",
+            "\n[Http]\nBindAddress = 127.0.0.1:{}\n",
             self.port
         ));
 
@@ -599,7 +591,7 @@ impl Tunnel {
                     .spawn(),
                 WarpProtocol::Masque => Command::new("usque")
                     .args([
-                        "socks",
+                        "http-proxy",
                         "-b",
                         "127.0.0.1",
                         "-p",
@@ -1546,13 +1538,8 @@ pub(crate) async fn wait_for_shutdown(shutdown: &Arc<AtomicBool>) {
 
 /// Builds a per-tunnel probe client. Pooling is disabled so a probe can never
 /// reuse a socket from a previous WARP registration.
-///
-/// The `socks5h` scheme is mandatory, not cosmetic: plain `socks5` resolves the
-/// hostname locally, so the probe reports the address this host sees rather
-/// than the tunnel's exit. Every tunnel then looks identical and the pool
-/// mistakes distinct exits for duplicates.
-fn build_probe_client(socks_port: u16) -> Option<reqwest::Client> {
-    let proxy = match reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", socks_port)) {
+fn build_probe_client(port: u16) -> Option<reqwest::Client> {
+    let proxy = match reqwest::Proxy::all(format!("http://127.0.0.1:{}", port)) {
         Ok(p) => p,
         Err(e) => {
             warn!("failed to create reqwest proxy: {}", e);

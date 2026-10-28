@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, v1, v1.2]
+    branches: [main, v1, v1.2, v2]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -161,7 +161,7 @@ jobs:
   deploy:
     name: trigger dokploy
     needs: merge
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

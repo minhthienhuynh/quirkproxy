@@ -1,23 +1,22 @@
-# QuirkProxy v1.3.0
+# QuirkProxy v2.0.0
 
-Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2API** with a **multi-identity Cloudflare WARP egress pool**.
+Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy powered by **Zen Proxy (Bun Engine)** with a **multi-identity Cloudflare WARP egress pool**.
 
 ## Highlights
 
-- **Zero-Maintenance Core Engine**: Powered by upstream `opencode2api` (Go binary, v1.4.5). Automatically supports all upstream OpenCode gates (Bun uTLS fingerprinting, descending session IDs, genuine byte-matched tool schemas, and multi-protocol translation for OpenAI Chat, Responses, and Anthropic Messages).
-- **Parallel WARP Egress Pool**: Instead of one identity rotated serially, the supervisor runs N independent WireGuard tunnels, each a separate WARP registration with its own egress IP. The engine receives one `socks5://...#pool` entry per tunnel, so a `429` on one exit retries on the *next* exit immediately instead of waiting ~30s for a re-registration that often returns the same address.
-- **Userspace Tunnelling**: Tunnels run through `wireproxy`, a userspace WireGuard client. No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no route changes — the host network stack and any host VPN/DNS/SSH setup stay untouched.
-- **Background Recycle**: When an exit burns out, one tunnel is re-registered in the background while the others keep serving. The request path never blocks on a registration. The tunnel is picked and claimed atomically, so concurrent refusals never recycle the same tunnel or drop one of the recycles.
-- **Refusal-Aware Rotation**: A `403` is not one condition. The supervisor classifies it into `quota` / `abuse` / `shape` / `geo` / `auth` / `version` and only recycles a tunnel for causes a new egress can actually fix.
-- **Stream-Safe**: Every in-flight response holds a guard until its last byte, so a manual rotation drains the pool first instead of truncating another client's stream mid-token. The guard is taken before the upstream call, so requests still waiting on the upstream count as in flight too.
-- **Duplicate Detection**: Cloudflare sometimes issues the same exit address to two registrations; the pool detects a duplicate at startup and recycles one. The comparison waits until every tunnel's readiness probe has finished, so a tunnel that has not produced an address yet is not mistaken for a unique one.
-- **Single Container**: `wgcf`, `wireproxy`, `opencode2api` and the Rust supervisor live in one image. No sidecars, no extra proxy nodes, no dedupe arbiter.
+- **BoringSSL Native TLS Fingerprint**: Powered by `zen-proxy` executed under **Bun runtime**. Matches 100% of OpenCode official CLI's TLS fingerprint to eliminate upstream bot detection and 429 quota-zeroing penalties.
+- **OpenCode 2.1.4 Wire Compatibility**: Full support for descending session IDs (`ses_...`), official 12-tool manifests, environment blocks (`<env>`), and multi-protocol translation (OpenAI Chat Completions, Responses, and Anthropic Messages for Claude Code CLI).
+- **Parallel WARP Egress Pool**: The supervisor runs N independent tunnels (userspace MASQUE HTTP/3 or WireGuard), each a separate WARP registration with its own egress IP. Requests cycle across the pool and hop exits on rate limits.
+- **Targeted Rotation & Auto-Healing (/v1/rotate/next)**: Automatically detects dead, unhealthy, banned, or exhausted tunnels and replaces only the damaged egress while preserving active warm tunnels.
+- **Userspace Tunnelling**: Tunnels run through `usque` (MASQUE over HTTP/3) or `wireproxy`. No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no route changes — the host network stack and any host VPN/DNS/SSH setup stay untouched.
+- **Stream-Safe**: In-flight responses hold a connection drain guard so tunnel recycling never truncates client streams mid-token.
+- **Single Container**: Bun, `usque`, `wireproxy`, and the Rust supervisor live in one image. No sidecars, no extra proxy nodes, no dedupe arbiter.
 - **Multi-Arch**: Dual native support for both `linux/amd64` and `linux/arm64` published as a multi-platform manifest list.
 
 ## Architecture
 
 ```
-[ Client / 9Router / OmniRoute ]
+[ Client / Hermes / 9Router / OmniRoute / Claude Code ]
              |
              v :8080 (PORT)
 +--------------------------------------------------------------+
@@ -25,16 +24,17 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 |                                                              |
 |   [ Rust Supervisor (Axum) ]                                 |
 |        |  - Reverse proxy :8080 -> :18088                    |
-|        |  - On 429/403: recycle a tunnel in the background   |
-|        |  - Retry lands on a different exit                  |
+|        |  - Watchdog & Targeted Rotation (/v1/rotate/next)   |
+|        |  - Preserves warm tunnels, auto-heals dead ones     |
 |        |                                                     |
-|        +--> [ opencode2api :18088 ]                          |
-|        |         |  "proxies": [40001#pool, 40002#pool, ...] |
+|        +--> [ Zen Proxy on Bun :18088 ]                      |
+|        |         |  BoringSSL TLS Fingerprint                |
+|        |         |  Auto Wire Spec 2.1.4                     |
 |        |         v                                           |
-|        +--> [ wireproxy x N (userspace WireGuard) ]          |
+|        +--> [ usque / wireproxy x N (HTTP Egress Pool) ]     |
 |                  :40001 --+                                  |
-|                  :40002 --+--> WARP --> distinct egress IPs  |
-|                  :40003 --+                                  |
+|                  :40002 --+--> Cloudflare WARP --> Egress IPs|
+|                  :40010 --+                                  |
 +-----------------+--------------------------------------------+
                   v
          [ OpenCode Upstream ]

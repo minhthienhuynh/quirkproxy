@@ -92,77 +92,49 @@ impl RestartBackoff {
 }
 
 fn ensure_opencode2api_config(config: &Config) -> Result<()> {
-    // The config is fully derived from env, so it must be regenerated on each boot.
-    // Keeping a stale file (e.g. old listen port) silently breaks the engine.
     if let Some(parent) = Path::new(&config.opencode2api_config).parent() {
         fs::create_dir_all(parent)?;
     }
 
     let config_json = serde_json::json!({
-        "listen": format!("127.0.0.1:{}", config.opencode_api_port),
-        "server_keys": [&config.server_key],
-        "zen_keys": [],
-        "go_keys": [],
-        "anonymous": true,
-        // One entry per WARP identity. The engine's anonymous pool gives every
-        // proxy its own node, so a 429 on one exit retries on the next instead
-        // of re-registering and waiting.
+        "host": "127.0.0.1",
+        "port": config.opencode_api_port,
+        "upstream": "https://opencode.ai/inference/openai/v1",
+        "proxyKey": config.server_key,
         "proxies": config.proxy_urls(),
-        "proxyfile": "",
-        "upstream": {
-            "zen": "https://opencode.ai/zen",
-            "go": "https://opencode.ai/zen/go",
-            "anonymous": "https://opencode.ai/inference"
-        },
-        "retry": {
-            "max_attempts": 3,
-            "timeout_seconds": 180
-        },
-        "models": {
-            "refresh_seconds": 300,
-            "free_only": true
-        },
-        "performance": {
-            "max_idle_conns": 256,
-            "max_idle_conns_per_host": 64,
-            "idle_conn_timeout_seconds": 60,
-            "connect_timeout_seconds": 10,
-            "failure_cooldown_seconds": 15
-        },
-        "logging": {
-            "level": "info",
-            "ring_size": 1000
-        },
-        "webui": {
-            "enabled": false
-        }
+        "autoUA": true,
+        "autoSync": true,
+        "injectSession": true,
     });
 
     fs::write(
         &config.opencode2api_config,
         serde_json::to_string_pretty(&config_json)?,
     )
-    .context("failed to write opencode2api config.json")?;
+    .context("failed to write zen-proxy config.json")?;
 
     info!(
-        "Generated opencode2api config at {}",
+        "Generated zen-proxy config at {}",
         config.opencode2api_config
     );
     Ok(())
 }
 
-/// Runs `opencode2api` as a managed child process, restarting it with
+/// Runs `zen-proxy` under Bun as a managed child process, restarting it with
 /// exponential backoff when it exits unexpectedly.
 async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
     let mut backoff = RestartBackoff::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         info!(
-            "Spawning opencode2api core engine (binary: {})...",
-            config.opencode2api_bin
+            "Spawning Zen Proxy Bun engine (binary: {}, script: {})...",
+            config.opencode2api_bin, config.opencode2api_script
         );
         let child = Command::new(&config.opencode2api_bin)
-            .args(["-config", &config.opencode2api_config])
+            .args([&config.opencode2api_script])
+            .env("PORT", config.opencode_api_port.to_string())
+            .env("HOST", "127.0.0.1")
+            .env("ZEN_PROXY_CONFIG", &config.opencode2api_config)
             .kill_on_drop(true)
             .spawn();
 
@@ -170,10 +142,7 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
             Ok(c) => c,
             Err(e) => {
                 let delay = backoff.on_spawn_failure();
-                error!(
-                    "Failed to spawn opencode2api: {}. Retrying in {:?}",
-                    e, delay
-                );
+                error!("Failed to spawn engine: {}. Retrying in {:?}", e, delay);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -184,9 +153,7 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
         tokio::select! {
             status = child.wait() => {
                 let uptime = started.elapsed();
-                warn!("opencode2api exited ({:?}) after {:?}", status, uptime);
-                // Only a run that stayed up long enough resets the backoff.
-                // A child that dies quickly keeps growing the delay.
+                warn!("zen-proxy exited ({:?}) after {:?}", status, uptime);
                 match backoff.on_child_exit(uptime) {
                     EngineExitAction::RespawnNow => continue,
                     EngineExitAction::SleepThenRespawn(delay) => {
@@ -196,7 +163,7 @@ async fn supervise_engine(config: Config, shutdown: Arc<AtomicBool>) {
                 }
             }
             _ = wait_for_shutdown(&shutdown) => {
-                info!("Supervisor shutting down opencode2api child...");
+                info!("Supervisor shutting down zen-proxy child...");
                 let _ = child.kill().await;
                 return;
             }
@@ -254,9 +221,9 @@ async fn main() -> Result<()> {
         .read_timeout(Duration::from_secs(180))
         .build()?;
 
-    let health_url = format!("{}/healthz", config.upstream_api);
+    let health_url = format!("{}/health", config.upstream_api);
     info!(
-        "Waiting for opencode2api engine to report healthy on {}...",
+        "Waiting for Zen Proxy engine to report healthy on {}...",
         health_url
     );
 
@@ -278,7 +245,7 @@ async fn main() -> Result<()> {
     }
 
     if ready {
-        info!("Core engine opencode2api is healthy and ready!");
+        info!("Core engine Zen Proxy is healthy and ready!");
     } else {
         warn!("Core engine startup timeout reached; proceeding to listen...");
     }

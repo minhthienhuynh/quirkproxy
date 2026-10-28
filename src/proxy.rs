@@ -49,13 +49,9 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let warp_status = state.warp.status().await;
 
-    // The engine reports 503 while its model catalog is refreshing (cold start
-    // or a transient upstream blip) but still serves requests. Distinguish
-    // "can serve" from "fully warmed" so the container is not marked degraded
-    // for a condition that resolves itself.
     let engine = match state
         .http_client
-        .get(format!("{}/healthz", state.config.upstream_api))
+        .get(format!("{}/health", state.config.upstream_api))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -65,9 +61,8 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             EngineHealth {
                 reachable: true,
-                // A 503 with models still loading is "warming", not "down".
                 ready: status.is_success(),
-                models_loaded: body["models"]["exposed"].as_u64().unwrap_or(0),
+                models_loaded: body["models"]["total"].as_u64().unwrap_or(0),
             }
         }
         Err(_) => EngineHealth {
@@ -90,7 +85,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "status": overall,
             "service": "QuirkProxy",
             "version": env!("CARGO_PKG_VERSION"),
-            "engine": "opencode2api",
+            "engine": "zen-proxy (Bun)",
             "engine_online": engine.reachable,
             "engine_ready": engine.ready,
             "engine_models": engine.models_loaded,
@@ -656,6 +651,7 @@ mod tests {
             warp_state_dir: "/tmp".into(),
             max_retries: 1,
             opencode2api_bin: "false".into(),
+            opencode2api_script: "/tmp/zen.mjs".into(),
             opencode2api_config: "/tmp/cfg.json".into(),
             server_key: "test-key".into(),
             max_concurrency: 1,

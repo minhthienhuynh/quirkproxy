@@ -4,18 +4,20 @@ Instructions for AI agents working in this repository.
 
 ## Architecture
 
-QuirkProxy is a Rust supervisor and reverse proxy wrapping `opencode2api` (core engine) and a userspace Cloudflare WARP egress pool:
+QuirkProxy is a Rust supervisor and reverse proxy wrapping `zen-proxy` (Bun core engine) and a userspace Cloudflare WARP egress pool:
 
 1. **Rust Supervisor (`src/`)**:
-   - Manages child process lifecycles: N `wireproxy` tunnels and `opencode2api`.
-   - Listens on `:8080` (Axum + Tokio + Reqwest) and proxies all incoming traffic to `opencode2api` on `:18088`.
-   - When `opencode2api` returns `HTTP 429` (Rate Limit) or a rotation-eligible `HTTP 403`, the supervisor recycles one tunnel in the background and retries the request, which lands on a different exit.
+   - Manages child process lifecycles: N `wireproxy` or `usque` tunnels and the `bun zen-proxy.mjs` engine.
+   - Listens on `:8080` (Axum + Tokio + Reqwest) and proxies incoming traffic to `zen-proxy` on `:18088`.
+   - When upstream returns `HTTP 429` (Rate Limit) or a rotation-eligible `HTTP 403`, the supervisor targeted-recycles dead or exhausted tunnels via `/v1/rotate/next`.
    - Handles graceful SIGTERM / SIGINT shutdown, keeping every child process reaped.
 
-2. **Core Engine (`opencode2api`)**:
-   - Unmodified official Go binary from `jasonxu114514/opencode2api`.
-   - Handles 100% of OpenCode protocol translation, Bun uTLS fingerprinting, session IDs, and tool calling schemas.
-   - Configured with one `"socks5://127.0.0.1:<port>#pool"` entry per tunnel. The engine builds one anonymous node per proxy and cycles `#pool` transports across retry attempts, so a burned exit is skipped instead of retried.
+2. **Core Engine (`zen-proxy` on Bun)**:
+   - High-performance, zero-dependency JavaScript engine executed natively under Bun.
+   - Preserves 100% native BoringSSL TLS fingerprint to eliminate upstream bot detection and 429 quota zeroing.
+   - Handles OpenCode 2.1.4 wire protocol translation, descending session IDs (`ses_...`), project hashes, tool schemas (`read` quartet/manifest), and environment blocks (`<env>`).
+   - Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages (Claude Code CLI).
+   - Configured with a pool of HTTP CONNECT proxies matching the WARP tunnels.
 
 3. **WARP tunnels (`wireproxy` / `usque`)**:
    - Each identity is a separate WARP registration; `wireproxy` speaks WireGuard in userspace, or `usque` speaks MASQUE over HTTP/3 (UDP:443). Both expose SOCKS5 on loopback.

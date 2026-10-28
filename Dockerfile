@@ -42,9 +42,10 @@ ENV WARP_STATE_DIR=/app/warp
 ENV WARP_PROTOCOL=wireguard
 ENV WARP_AUTO_ROTATE_429=true
 ENV WARP_AUTO_ROTATE_403=true
-ENV OPENCODE2API_BIN=/usr/local/bin/opencode2api
-ENV OPENCODE2API_CONFIG=/app/config.json
-ENV OPENCODE2API_VERSION=v1.4.5
+ENV ENGINE_BIN=/usr/local/bin/bun
+ENV ENGINE_SCRIPT=/app/engine/zen-proxy.mjs
+ENV ENGINE_CONFIG=/app/zen-proxy.json
+ENV BUN_VERSION=1.4.4
 ENV WGCF_VERSION=v2.3.1
 ENV WIREPROXY_VERSION=v1.1.3
 ENV USQUE_VERSION=v4.2.1
@@ -96,25 +97,27 @@ RUN ARCH=$(dpkg --print-architecture) \
     && chmod +x /usr/local/bin/usque \
     && rm -rf /tmp/usque*
 
-# 3. Download official opencode2api release binary
+# 3. Install Bun runtime
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
-         amd64) OPENCODE_SHA256="469ea7ab6eb38d409378748721607daef55a770b92cc9e2466a5aad81639fcf2" ;; \
-         arm64) OPENCODE_SHA256="6a34a93026e4d91a3e55cbe04bc387a94dffaafaa606caef5ed01fa3c5248a98" ;; \
+         amd64) BUN_ARCH="x64"; BUN_SHA256="bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c" ;; \
+         arm64) BUN_ARCH="aarch64"; BUN_SHA256="baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e" ;; \
          *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
        esac \
-    && echo "Downloading opencode2api ${OPENCODE2API_VERSION} for ${ARCH}..." \
-    && curl -fsSL -o /tmp/opencode2api.tar.gz "https://github.com/jasonxu114514/opencode2api/releases/download/${OPENCODE2API_VERSION}/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}.tar.gz" \
-    && echo "${OPENCODE_SHA256}  /tmp/opencode2api.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/opencode2api.tar.gz -C /tmp \
-    && mv /tmp/opencode2api_${OPENCODE2API_VERSION}_linux_${ARCH}/opencode2api /usr/local/bin/opencode2api \
-    && chmod +x /usr/local/bin/opencode2api \
-    && rm -rf /tmp/opencode2api*
+    && curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip" \
+    && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
+    && unzip -q -o /tmp/bun.zip -d /tmp \
+    && mv /tmp/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun \
+    && chmod +x /usr/local/bin/bun \
+    && rm -rf /tmp/bun*
 
 WORKDIR /app
-RUN mkdir -p /app/warp
+RUN mkdir -p /app/warp /app/engine
 
-# 3. Copy Rust supervisor binary from builder
+# 4. Copy Zen Proxy engine assets
+COPY engine/ /app/engine/
+
+# 5. Copy Rust supervisor binary from builder
 COPY --from=builder /build/target/release/quirkproxy /usr/local/bin/quirkproxy
 RUN chmod +x /usr/local/bin/quirkproxy
 
