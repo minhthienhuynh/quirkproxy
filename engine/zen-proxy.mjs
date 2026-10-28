@@ -338,6 +338,12 @@ const DEFAULT_CONFIG = {
   // fails transiently (429/5xx/network) before the fallback chain moves on.
   retriesPerModel: envNum("RETRIES_PER_MODEL", 2),
   retryBackoffMs: envNum("RETRY_BACKOFF_MS", 500),
+  // A `retry-after` beyond this window is a spent free bucket for hours, not a
+  // queue hiccup. Waiting on it buys nothing while the fallback chain still has
+  // to move on, so the wait is skipped and the next candidate is tried at once.
+  // Before this, every 429 slept a flat 3s per candidate: an 8-model chain spent
+  // ~24s asleep before it could report the same verdict it already had.
+  hardQuotaWindowMs: envNum("HARD_QUOTA_WINDOW_MS", 60_000),
   rateLimitMax: envNum("RATE_LIMIT_MAX", 0),
   rateLimitWindowMs: envNum("RATE_LIMIT_WINDOW_MS", 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
@@ -613,6 +619,18 @@ function parseRetryAfter(v) {
   const t = Date.parse(v)
   if (Number.isFinite(t)) return Math.max(0, (t - Date.now()) / 1000)
   return 0
+}
+
+// How long to actually sleep on a `retry-after` before trying the next
+// candidate. A short window is a real queue cooldown the next hop should respect;
+// a long one (hours) is a spent free bucket that no amount of waiting fixes, so
+// the chain moves on immediately instead of spending the caller's latency on a
+// deadline it cannot meet. Returns 0 when the wait should be skipped.
+function retryPauseMs(retryAfterSeconds, ceilingMs) {
+  const ms = retryAfterSeconds * 1000
+  if (!Number.isFinite(ms) || ms <= 0) return 0
+  if (ms > config.hardQuotaWindowMs) return 0
+  return Math.min(ms, ceilingMs)
 }
 
 const RETRYABLE_ERROR_TYPES = new Set([
@@ -1721,7 +1739,7 @@ async function handleMessages(req, res) {
         attempt--
         continue
       }
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      const retryAfterMs = retryPauseMs(parseRetryAfter(upstreamRes.headers.get("retry-after")), 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
@@ -2003,7 +2021,7 @@ async function handleChat(req, res, responsesRoute = false) {
         attempt--
         continue
       }
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      const retryAfterMs = retryPauseMs(parseRetryAfter(upstreamRes.headers.get("retry-after")), 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
