@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: quirkproxy:v1.2
+    image: quirkproxy:v1.3
     container_name: quirkproxy
     restart: unless-stopped
     environment:
@@ -12,7 +12,7 @@ services:
       - OPENCODE2API_PORT=${OPENCODE2API_PORT:-18088}
       - UPSTREAM_API=${UPSTREAM_API:-http://127.0.0.1:18088}
       - WARP_ENABLED=${WARP_ENABLED:-true}
-      - WARP_IDENTITIES=${WARP_IDENTITIES:-5}
+      - WARP_IDENTITIES=${WARP_IDENTITIES:-10}
       - WARP_BASE_SOCKS_PORT=${WARP_BASE_SOCKS_PORT:-40001}
       - WARP_STATE_DIR=${WARP_STATE_DIR:-/app/warp}
       - WARP_PROTOCOL=${WARP_PROTOCOL:-wireguard}

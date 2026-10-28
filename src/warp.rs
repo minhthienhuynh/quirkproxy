@@ -70,6 +70,26 @@ const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// recycle (including /v1/rotate) forever.
 const WGCF_TIMEOUT: Duration = Duration::from_secs(45);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TunnelCondition {
+    #[default]
+    Active,
+    Unhealthy,      // Process died, SOCKS5 closed, or probe failed
+    Banned,         // 403 Abuse detected
+    QuotaExhausted, // 429 FreeUsageLimitError confirmed
+}
+
+impl TunnelCondition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Unhealthy => "unhealthy",
+            Self::Banned => "banned",
+            Self::QuotaExhausted => "quota_exhausted",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RotateRecord {
     pub tunnel: usize,
@@ -79,6 +99,20 @@ pub struct RotateRecord {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SingleRotateOutcome {
+    pub status: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_ip: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TunnelStatus {
     pub index: usize,
@@ -86,6 +120,7 @@ pub struct TunnelStatus {
     pub ip: Option<String>,
     pub healthy: bool,
     pub recycling: bool,
+    pub condition: String,
     /// Requests currently riding this tunnel.
     ///
     /// Counted from the socket table, so it is per tunnel: the engine picks
@@ -136,6 +171,7 @@ struct TunnelState {
     /// Cleared while the child is down; the supervisor sets it again once the
     /// SOCKS5 listener answers a probe.
     healthy: bool,
+    condition: TunnelCondition,
     /// Incremented every time the supervisor spawns a wireproxy child. A
     /// recycle records this before asking for a restart and waits for it to
     /// advance, which is how it knows the new config is actually in effect
@@ -510,6 +546,9 @@ impl Tunnel {
                 Some(ip) => {
                     st.ip = Some(ip);
                     st.healthy = true;
+                    if st.condition == TunnelCondition::Unhealthy {
+                        st.condition = TunnelCondition::Active;
+                    }
                 }
                 None => {
                     // A failed probe must not wipe a known-good exit address
@@ -519,6 +558,7 @@ impl Tunnel {
                     // "healthy" and "no IP".
                     if st.ip.is_none() {
                         st.healthy = false;
+                        st.condition = TunnelCondition::Unhealthy;
                     }
                 }
             }
@@ -619,7 +659,11 @@ impl Tunnel {
                         self.index, daemon_name, status, uptime
                     );
                     cancelled.store(true, Ordering::Relaxed);
-                    self.state.lock().await.healthy = false;
+                    {
+                        let mut st = self.state.lock().await;
+                        st.healthy = false;
+                        st.condition = TunnelCondition::Unhealthy;
+                    }
                     if uptime >= TUNNEL_STABLE_UPTIME {
                         backoff = Duration::from_secs(1);
                         respawn_now = true;
@@ -633,6 +677,7 @@ impl Tunnel {
                     {
                         let mut st = self.state.lock().await;
                         st.healthy = false;
+                        st.condition = TunnelCondition::Unhealthy;
                         // Bump this *before* the next spawn so a waiter can
                         // tell "restart serviced" from "child crashed and
                         // was respawned".
@@ -672,6 +717,7 @@ impl Tunnel {
             ip: st.ip.clone(),
             healthy: st.healthy,
             recycling: self.recycling.load(Ordering::Relaxed),
+            condition: st.condition.as_str().to_string(),
             connections,
         }
     }
@@ -681,8 +727,6 @@ pub struct WarpPool {
     tunnels: Vec<Arc<Tunnel>>,
     enabled: bool,
     pub protocol: WarpProtocol,
-    /// Round-robin cursor for picking which tunnel to recycle.
-    cursor: AtomicUsize,
     /// Global count of streams currently riding any tunnel.
     inflight: Arc<AtomicUsize>,
     /// Serialises re-registrations: two concurrent `wgcf register` runs in the
@@ -720,6 +764,7 @@ impl WarpPool {
                         ip: None,
                         last_recycle: Instant::now() - RECYCLE_COOLDOWN,
                         healthy: false,
+                        condition: TunnelCondition::Unhealthy,
                         spawn_generation: 0,
                         restart_generation: 0,
                         probe_completed: false,
@@ -736,7 +781,6 @@ impl WarpPool {
             tunnels,
             enabled,
             protocol,
-            cursor: AtomicUsize::new(0),
             inflight: Arc::new(AtomicUsize::new(0)),
             recycle_lock: Mutex::new(()),
             rotations: AtomicUsize::new(0),
@@ -853,6 +897,22 @@ impl WarpPool {
             pool.recycle_duplicate_egresses().await;
         });
 
+        // Background watchdog: periodically checks tunnel health and automatically
+        // replaces dead tunnels.
+        let pool_watchdog = self.clone();
+        let watchdog_shutdown = shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip initial immediate tick
+            while !watchdog_shutdown.load(Ordering::Relaxed) {
+                interval.tick().await;
+                if watchdog_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                pool_watchdog.auto_heal_dead_tunnels().await;
+            }
+        }));
+
         handles
     }
 
@@ -945,61 +1005,175 @@ impl WarpPool {
     /// than an arbitrary one: that is the tunnel whose streams are closest to
     /// finishing, so the drain in `recycle_locked` has the best chance of
     /// completing before the child is killed.
-    fn claim_tunnel(&self) -> Option<Arc<Tunnel>> {
+    /// Checks all tunnels and automatically triggers background replacement
+    /// for any tunnel that is confirmed dead (egress probe failed).
+    pub async fn auto_heal_dead_tunnels(self: &Arc<Self>) {
+        if !self.enabled() {
+            return;
+        }
+
+        for tunnel in &self.tunnels {
+            if tunnel.recycling.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let probe_res = tunnel.probe_ip().await;
+            let mut st = tunnel.state.lock().await;
+            match probe_res {
+                Some(ip) => {
+                    st.ip = Some(ip);
+                    st.healthy = true;
+                    if st.condition == TunnelCondition::Unhealthy {
+                        st.condition = TunnelCondition::Active;
+                    }
+                }
+                None => {
+                    st.healthy = false;
+                    st.condition = TunnelCondition::Unhealthy;
+                    let elapsed = st.last_recycle.elapsed();
+                    drop(st);
+
+                    warn!(
+                        "Tunnel {} (port {}) is dead (egress probe failed). Triggering automatic replacement...",
+                        tunnel.index, tunnel.port
+                    );
+
+                    if elapsed >= RECYCLE_COOLDOWN
+                        && tunnel
+                            .recycling
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        let pool = self.clone();
+                        let t = tunnel.clone();
+                        tokio::spawn(async move {
+                            pool.recycle_locked(t, "automatic replacement of dead tunnel")
+                                .await;
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Picks a candidate tunnel for single/staggered replacement *and* claims it.
+    ///
+    /// Selection priority:
+    /// 1. Targeted tunnel if `target_idx` is specified (e.g. `?tunnel=i`).
+    /// 2. Dead / Unhealthy tunnels (`!healthy` or `condition == Unhealthy`).
+    /// 3. Banned tunnels (`condition == Banned`).
+    /// 4. Quota-exhausted tunnels (`condition == QuotaExhausted`).
+    /// 5. If `allow_active` is true (e.g. `force=true`), falls back to the oldest idle healthy tunnel.
+    ///    If `allow_active` is false, returns `None` (preserving all active warm tunnels).
+    pub fn claim_target_tunnel(
+        &self,
+        target_idx: Option<usize>,
+        allow_active: bool,
+    ) -> Option<Arc<Tunnel>> {
         let n = self.tunnels.len();
         if n == 0 {
             return None;
         }
 
-        let mut fallback: Option<(usize, Arc<Tunnel>)> = None;
+        // 1. If a specific tunnel index is requested
+        if let Some(idx) = target_idx {
+            if let Some(t) = self.tunnels.get(idx) {
+                if !t.recycling.load(Ordering::Relaxed) {
+                    let eligible = match t.state.try_lock() {
+                        Ok(st) => st.last_recycle.elapsed() >= RECYCLE_COOLDOWN,
+                        Err(_) => false,
+                    };
+                    if eligible
+                        && t.recycling
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        return Some(t.clone());
+                    }
+                }
+            }
+            return None;
+        }
 
-        for _ in 0..n {
-            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
-            let t = &self.tunnels[start];
+        // 2. Collect eligible tunnels grouped by tier
+        let mut tier1 = Vec::new(); // Dead / Unhealthy
+        let mut tier2 = Vec::new(); // Banned
+        let mut tier3 = Vec::new(); // QuotaExhausted
+        let mut tier4 = Vec::new(); // Active / Healthy
+
+        for t in &self.tunnels {
             if t.recycling.load(Ordering::Relaxed) {
                 continue;
             }
-            let eligible = match t.state.try_lock() {
-                Ok(st) => st.last_recycle.elapsed() >= RECYCLE_COOLDOWN,
-                Err(_) => false,
-            };
-            if !eligible {
-                continue;
-            }
-            let busy = t.active_connections();
-            if busy == 0 {
-                // An idle tunnel: the best possible victim, take it now.
-                if t.recycling
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    // Another caller claimed it first; try the next candidate.
-                    continue;
+            let (elapsed, healthy, cond) = match t.state.try_lock() {
+                Ok(st) if st.last_recycle.elapsed() >= RECYCLE_COOLDOWN => {
+                    (st.last_recycle.elapsed(), st.healthy, st.condition)
                 }
-                return Some(t.clone());
-            }
-            // Busy, but keep the least busy one as the fallback.
-            let better = match &fallback {
-                Some((current_busy, _)) => busy < *current_busy,
-                None => true,
+                _ => continue,
             };
-            if better {
-                fallback = Some((busy, t.clone()));
+            let busy = t.active_connections();
+            let entry = (elapsed, busy, t.clone());
+
+            if !healthy || cond == TunnelCondition::Unhealthy {
+                tier1.push(entry);
+            } else if cond == TunnelCondition::Banned {
+                tier2.push(entry);
+            } else if cond == TunnelCondition::QuotaExhausted {
+                tier3.push(entry);
+            } else {
+                tier4.push(entry);
             }
         }
 
-        // Every eligible tunnel is busy. Take the least busy one -- a recycle
-        // is never skipped just because the pool is under load, since a
-        // burned exit has to be replaced even at that cost.
-        let (_, tunnel) = fallback?;
-        if tunnel
-            .recycling
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return None;
+        let try_claim_tier = |mut candidates: Vec<(Duration, usize, Arc<Tunnel>)>| {
+            if candidates.is_empty() {
+                return None;
+            }
+            candidates.sort_by(|a, b| {
+                let a_idle = a.1 == 0;
+                let b_idle = b.1 == 0;
+                match (a_idle, b_idle) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)),
+                }
+            });
+            candidates
+                .into_iter()
+                .find(|(_, _, tunnel)| {
+                    tunnel
+                        .recycling
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                })
+                .map(|(_, _, tunnel)| tunnel)
+        };
+
+        for tier in [tier1, tier2, tier3] {
+            if let Some(t) = try_claim_tier(tier) {
+                return Some(t);
+            }
         }
-        Some(tunnel)
+
+        if allow_active {
+            if let Some(t) = try_claim_tier(tier4) {
+                return Some(t);
+            }
+        }
+
+        None
+    }
+
+    /// Convenience wrapper preserving backwards compatibility for oldest-tunnel selection.
+    #[cfg(test)]
+    pub fn claim_oldest_tunnel(&self) -> Option<Arc<Tunnel>> {
+        self.claim_target_tunnel(None, true)
+    }
+
+    /// Picks a tunnel for background recycling on refusal: prioritizes dead/banned/exhausted
+    /// tunnels first, falling back to an idle active tunnel only if necessary.
+    fn claim_tunnel(&self) -> Option<Arc<Tunnel>> {
+        self.claim_target_tunnel(None, true)
     }
 
     /// Recycles one tunnel in the background: new identity, new egress IP.
@@ -1183,6 +1357,56 @@ impl WarpPool {
         }
 
         first_ip.context("failed to verify any new egress IP across the pool")
+    }
+
+    /// Operator or cron-triggered staggered rotation: claims a dead, banned, or exhausted
+    /// tunnel to replace it with a fresh identity.
+    ///
+    /// If all tunnels are active and healthy, returns `SingleRotateOutcome` with status `"noop"`
+    /// unless `force` is set to true (which falls back to replacing the oldest idle tunnel).
+    pub async fn rotate_next(
+        &self,
+        reason: &str,
+        target_idx: Option<usize>,
+        force: bool,
+    ) -> Result<SingleRotateOutcome> {
+        if !self.enabled() {
+            anyhow::bail!("WARP pool is disabled");
+        }
+
+        let tunnel = match self.claim_target_tunnel(target_idx, force) {
+            Some(t) => t,
+            None => {
+                return Ok(SingleRotateOutcome {
+                    status: "noop".into(),
+                    message: "All tunnels are active and healthy. No replacement needed.".into(),
+                    tunnel: None,
+                    port: None,
+                    old_ip: None,
+                    new_ip: None,
+                });
+            }
+        };
+
+        let tunnel_idx = tunnel.index;
+        let port = tunnel.port;
+        let old_ip = tunnel.state.lock().await.ip.clone();
+
+        let new_ip = self.recycle_locked(tunnel, reason).await.context(
+            "failed to recycle tunnel (stream drain timed out or new egress could not be verified)",
+        )?;
+
+        Ok(SingleRotateOutcome {
+            status: "success".into(),
+            message: format!(
+                "Successfully replaced tunnel {} (port {})",
+                tunnel_idx, port
+            ),
+            tunnel: Some(tunnel_idx),
+            port: Some(port),
+            old_ip,
+            new_ip: Some(new_ip),
+        })
     }
 
     pub async fn status(&self) -> WarpStatus {
@@ -1412,6 +1636,140 @@ mod tests {
         let first = pool.claim_tunnel().expect("the tunnel should be claimable");
         assert_eq!(first.index, 0);
         assert!(pool.claim_tunnel().is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_oldest_tunnel_picks_the_oldest_idle_tunnel() {
+        let pool = pool_with(3);
+        let t0 = pool.tunnels[0].clone();
+        let t1 = pool.tunnels[1].clone();
+        let t2 = pool.tunnels[2].clone();
+
+        let now = Instant::now();
+        t0.state.lock().await.last_recycle = now - Duration::from_secs(100);
+        t1.state.lock().await.last_recycle = now - Duration::from_secs(300);
+        t2.state.lock().await.last_recycle = now - Duration::from_secs(70);
+
+        let picked = pool.claim_oldest_tunnel().expect("should pick a tunnel");
+        assert_eq!(
+            picked.index, 1,
+            "t1 should be picked because it is the oldest"
+        );
+        assert!(picked.recycling.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn claim_oldest_tunnel_skips_cooldown_and_recycling() {
+        let pool = pool_with(2);
+        let t0 = pool.tunnels[0].clone();
+        let t1 = pool.tunnels[1].clone();
+
+        let now = Instant::now();
+        // t0 is already recycling
+        t0.recycling.store(true, Ordering::SeqCst);
+        t0.state.lock().await.last_recycle = now - Duration::from_secs(300);
+
+        // t1 was recycled 10s ago (< RECYCLE_COOLDOWN)
+        t1.state.lock().await.last_recycle = now - Duration::from_secs(10);
+
+        assert!(
+            pool.claim_oldest_tunnel().is_none(),
+            "no tunnel should be eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_target_tunnel_prefers_unhealthy_over_healthy() {
+        let pool = pool_with(2);
+        let t0 = pool.tunnels[0].clone();
+        let t1 = pool.tunnels[1].clone();
+
+        let now = Instant::now();
+        // t0 is healthy Active, elapsed 500s
+        {
+            let mut st = t0.state.lock().await;
+            st.healthy = true;
+            st.condition = TunnelCondition::Active;
+            st.last_recycle = now - Duration::from_secs(500);
+        }
+        // t1 is Unhealthy, elapsed 80s
+        {
+            let mut st = t1.state.lock().await;
+            st.healthy = false;
+            st.condition = TunnelCondition::Unhealthy;
+            st.last_recycle = now - Duration::from_secs(80);
+        }
+
+        let picked = pool
+            .claim_target_tunnel(None, false)
+            .expect("should pick unhealthy tunnel");
+        assert_eq!(
+            picked.index, 1,
+            "t1 should be picked because it is unhealthy"
+        );
+        assert!(picked.recycling.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn claim_target_tunnel_prefers_banned_over_quota_exhausted() {
+        let pool = pool_with(2);
+        let t0 = pool.tunnels[0].clone();
+        let t1 = pool.tunnels[1].clone();
+
+        let now = Instant::now();
+        {
+            let mut st = t0.state.lock().await;
+            st.healthy = true;
+            st.condition = TunnelCondition::QuotaExhausted;
+            st.last_recycle = now - Duration::from_secs(200);
+        }
+        {
+            let mut st = t1.state.lock().await;
+            st.healthy = true;
+            st.condition = TunnelCondition::Banned;
+            st.last_recycle = now - Duration::from_secs(100);
+        }
+
+        let picked = pool
+            .claim_target_tunnel(None, false)
+            .expect("should pick banned tunnel");
+        assert_eq!(picked.index, 1, "t1 should be picked because it is banned");
+    }
+
+    #[tokio::test]
+    async fn claim_target_tunnel_returns_none_when_all_healthy_and_not_forced() {
+        let pool = pool_with(2);
+        let t0 = pool.tunnels[0].clone();
+        let t1 = pool.tunnels[1].clone();
+
+        let now = Instant::now();
+        for t in [&t0, &t1] {
+            let mut st = t.state.lock().await;
+            st.healthy = true;
+            st.condition = TunnelCondition::Active;
+            st.last_recycle = now - Duration::from_secs(500);
+        }
+
+        assert!(
+            pool.claim_target_tunnel(None, false).is_none(),
+            "should not rotate any tunnel when all are healthy and active"
+        );
+        assert!(
+            pool.claim_target_tunnel(None, true).is_some(),
+            "forced should allow picking an active tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_target_tunnel_supports_explicit_index() {
+        let pool = pool_with(3);
+        let t1 = pool.tunnels[1].clone();
+        t1.state.lock().await.last_recycle = Instant::now() - Duration::from_secs(200);
+
+        let picked = pool
+            .claim_target_tunnel(Some(1), false)
+            .expect("should claim requested index");
+        assert_eq!(picked.index, 1);
     }
 
     #[tokio::test]

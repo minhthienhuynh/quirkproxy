@@ -53,7 +53,7 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
-| `WARP_IDENTITIES` | `5` | Number of parallel WARP identities. `0` disables the pool. |
+| `WARP_IDENTITIES` | `10` | Number of parallel WARP identities. `0` disables the pool. |
 | `WARP_PROTOCOL` | `wireguard` | Tunnel egress protocol: `wireguard` (userspace `wireproxy`) or `masque` (HTTP/3 Connect-IP `usque`) |
 | `WARP_BASE_SOCKS_PORT` | `40001` | First SOCKS5 port of the pool |
 | `WARP_STATE_DIR` | `/app/warp` | Where per-identity WireGuard profiles are stored |
@@ -79,7 +79,7 @@ services:
     ports:
       - "127.0.0.1:${QUIRK_HOST_PORT:-18080}:${PORT:-8080}"
     environment:
-      - WARP_IDENTITIES=${WARP_IDENTITIES:-5}
+      - WARP_IDENTITIES=${WARP_IDENTITIES:-10}
       - SERVER_KEY=${SERVER_KEY:-local-test-key}
     volumes:
       - warp-identities:/app/warp
@@ -96,7 +96,8 @@ new identities and rotate all egress IPs.
 ### Endpoints
 
 - `GET /healthz` — Liveness & status. `status` is `healthy` (engine ready), `warming` (engine reachable, catalog still loading) or `degraded` (engine unreachable). Reports `inflight`, `engine_models`, and `warp.{identities,healthy,tunnels[]}` where each tunnel carries its own `ip` / `healthy` / `recycling`. There is no top-level egress IP: with a pool there is no single answer.
-- `POST /v1/rotate` — Rotate every tunnel. Requires `Authorization: Bearer <SERVER_KEY>`. Drains in-flight streams first.
+- `POST /v1/rotate` — Rotate every tunnel in the pool. Requires `Authorization: Bearer $SERVER_KEY`. Drains in-flight streams first.
+- `POST /v1/rotate/next` (or `POST /v1/rotate?mode=next`) — Targeted replacement: detects, drains, and recycles dead (`unhealthy`), `banned`, or `quota_exhausted` tunnels while keeping healthy tunnels active. If all tunnels are active and healthy, returns a `noop` response preserving warm IP quota unless forced via `?force=true`. Supports explicit targeting via `?tunnel=<index>`.
 - `GET /v1/models` — Proxied to opencode2api.
 - `POST /v1/chat/completions` — Proxied with automatic refusal-aware retry.
 - `POST /v1/responses` — Proxied to the opencode2api Responses endpoint.

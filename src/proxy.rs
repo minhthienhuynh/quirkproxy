@@ -1,12 +1,13 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,10 +125,30 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+fn validate_auth(headers: &HeaderMap, server_key: &str) -> bool {
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+
+    !server_key.trim().is_empty()
+        && !provided.trim().is_empty()
+        && constant_time_eq(provided, server_key)
+}
+
+#[derive(Deserialize, Default)]
+pub struct RotateQuery {
+    pub mode: Option<String>,
+    pub tunnel: Option<usize>,
+    pub force: Option<bool>,
+}
+
 pub async fn trigger_rotate(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+    Query(query): Query<RotateQuery>,
+) -> Response {
     if !state.warp.enabled() {
         return (
             StatusCode::BAD_REQUEST,
@@ -135,28 +156,27 @@ pub async fn trigger_rotate(
                 "status": "disabled",
                 "message": "Cloudflare WARP is disabled in configuration"
             })),
-        );
+        )
+            .into_response();
     }
 
     // Rotation is expensive (drops the current egress identity): never allow
     // unauthenticated callers to trigger it.
-    let provided = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-
-    if state.config.server_key.trim().is_empty()
-        || provided.trim().is_empty()
-        || !constant_time_eq(provided, &state.config.server_key)
-    {
+    if !validate_auth(&headers, &state.config.server_key) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "status": "unauthorized",
                 "message": "Missing or invalid bearer token"
             })),
-        );
+        )
+            .into_response();
+    }
+
+    if query.mode.as_deref() == Some("next") || query.mode.as_deref() == Some("staggered") {
+        return trigger_rotate_next(State(state), headers, Query(query))
+            .await
+            .into_response();
     }
 
     match state
@@ -171,14 +191,76 @@ pub async fn trigger_rotate(
                 "new_ip": new_ip,
                 "warp": state.warp.status().await,
             })),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "status": "error",
                 "message": e.to_string(),
             })),
-        ),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn trigger_rotate_next(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RotateQuery>,
+) -> Response {
+    if !state.warp.enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "disabled",
+                "message": "Cloudflare WARP is disabled in configuration"
+            })),
+        )
+            .into_response();
+    }
+
+    if !validate_auth(&headers, &state.config.server_key) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "status": "unauthorized",
+                "message": "Missing or invalid bearer token"
+            })),
+        )
+            .into_response();
+    }
+
+    match state
+        .warp
+        .rotate_next(
+            "Manual API Trigger (/v1/rotate/next)",
+            query.tunnel,
+            query.force.unwrap_or(false),
+        )
+        .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": outcome.status,
+                "message": outcome.message,
+                "tunnel": outcome.tunnel,
+                "port": outcome.port,
+                "old_ip": outcome.old_ip,
+                "new_ip": outcome.new_ip,
+                "warp": state.warp.status().await,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
     }
 }
 
