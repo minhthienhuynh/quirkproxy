@@ -1,7 +1,7 @@
 .PHONY: build run test clean
 
 build:
-	docker build -t quirkproxy:v1.2 .
+	docker build -t quirkproxy:v1.3 .
 
 run:
 	docker compose up -d

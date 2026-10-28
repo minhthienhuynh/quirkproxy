@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(proxy::healthz))
         .route("/v1/rotate", post(proxy::trigger_rotate))
+        .route("/v1/rotate/next", post(proxy::trigger_rotate_next))
         .fallback(proxy::proxy_handler)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

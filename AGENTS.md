@@ -17,10 +17,10 @@ QuirkProxy is a Rust supervisor and reverse proxy wrapping `opencode2api` (core 
    - Handles 100% of OpenCode protocol translation, Bun uTLS fingerprinting, session IDs, and tool calling schemas.
    - Configured with one `"socks5://127.0.0.1:<port>#pool"` entry per tunnel. The engine builds one anonymous node per proxy and cycles `#pool` transports across retry attempts, so a burned exit is skipped instead of retried.
 
-3. **WARP tunnels (`wgcf` + `wireproxy`)**:
-   - Each identity is a separate WARP registration; `wireproxy` speaks WireGuard in userspace and exposes SOCKS5 on loopback.
+3. **WARP tunnels (`wireproxy` / `usque`)**:
+   - Each identity is a separate WARP registration; `wireproxy` speaks WireGuard in userspace, or `usque` speaks MASQUE over HTTP/3 (UDP:443). Both expose SOCKS5 on loopback.
    - No `tun0`, no `NET_ADMIN`, no `/dev/net/tun`, no host route changes.
-   - `wgcf register` refuses to overwrite an existing account, so `re_register()` deletes `wgcf-account.toml` / `wgcf-profile.conf` first.
+   - For WireGuard, `wgcf register` refuses to overwrite an existing account, so `re_register()` deletes `wgcf-account.toml` / `wgcf-profile.conf` first. For MASQUE, stale `config.json` is removed before `usque register`.
    - Profiles live in `WARP_STATE_DIR` (a volume). Losing the volume means new identities and new egress IPs on next boot.
 
 4. **Refusal gate (`src/gate.rs`)**:
