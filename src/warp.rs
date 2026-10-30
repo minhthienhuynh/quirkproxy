@@ -57,6 +57,25 @@ const TUNNEL_STREAM_MIN_AGE: Duration = Duration::from_secs(3);
 const TUNNEL_QUIET_WINDOW: Duration = Duration::from_millis(250);
 /// How often the tunnel drain re-reads the socket table.
 const TUNNEL_DRAIN_POLL: Duration = Duration::from_millis(100);
+/// Per-request timeout of one egress probe.
+///
+/// Healthy exits answer in 62-159ms through the pool (measured 2026-10-30, five
+/// samples x four tunnels), so 3s leaves ~19x headroom while keeping a watchdog
+/// pass short: the probe tries two URLs, so a wedged exit costs 2 x 3s = 6s and
+/// still fits inside the 15s interval with the probes running concurrently.
+/// The previous 8s made a wedged pass cost 16s -- longer than the interval.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the background watchdog probes the pool.
+///
+/// Bounded below by a pass length rather than by cost: a pass is one concurrent
+/// probe round, and a wedged exit costs two probe timeouts (the probe tries two
+/// URLs), i.e. 6s. 15s leaves room for that without passes overlapping.
+///
+/// The interval matters because it IS the cost: an exit that is bound but wedged
+/// stays in the engine's static proxy list until the watchdog replaces it, and
+/// every request that draws one pays the engine's hardcoded 10s SOCKS handshake
+/// timeout (measured: `anon:transport:10009ms`).
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(15);
 /// A tunnel that ran this long before dying is restarted immediately instead
 /// of with backoff (crash loop vs. one-off crash).
 const TUNNEL_STABLE_UPTIME: Duration = Duration::from_secs(30);
@@ -142,6 +161,17 @@ pub struct WarpStatus {
     pub healthy: usize,
     pub proxy_urls: Vec<String>,
     pub rotations: usize,
+    /// Distinct quota scopes (`/64` on IPv6, `/32` on IPv4) currently held.
+    ///
+    /// This is the number that bounds free-tier capacity. `healthy` counts
+    /// tunnels, and ten healthy tunnels can sit in eight scopes — two of them
+    /// then spend the same bucket. Reported separately so the gap is visible
+    /// instead of being inferred from `tunnels[].ip`.
+    pub scopes: usize,
+    /// `retry-after` of the largest spent-bucket 429 seen since boot, in
+    /// seconds. `None` until one arrives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_window_secs: Option<u64>,
     pub tunnels: Vec<TunnelStatus>,
     pub history: Vec<RotateRecord>,
 }
@@ -734,6 +764,15 @@ pub struct WarpPool {
     recycle_lock: Mutex<()>,
     rotations: AtomicUsize,
     history: Mutex<Vec<RotateRecord>>,
+    /// `retry-after` (seconds) of the last 429 that outlived
+    /// `WARP_QUOTA_ROTATE_MAX_WINDOW`, if any.
+    ///
+    /// The supervisor cannot attribute an upstream refusal to one tunnel: the
+    /// engine picks the proxy per attempt and reports only the status. What it
+    /// can state is that *some* egress is out of free quota for the rest of the
+    /// window, which is what a caller needs in order to stop retrying into the
+    /// same daily verdict.
+    quota_window_secs: Mutex<Option<u64>>,
 }
 
 impl WarpPool {
@@ -785,7 +824,17 @@ impl WarpPool {
             recycle_lock: Mutex::new(()),
             rotations: AtomicUsize::new(0),
             history: Mutex::new(Vec::new()),
+            quota_window_secs: Mutex::new(None),
         }
+    }
+
+    /// Records that some egress answered a 429 whose `retry-after` outlives
+    /// `WARP_QUOTA_ROTATE_MAX_WINDOW`, i.e. a spent daily bucket.
+    pub async fn note_quota_window(&self, secs: u64) {
+        let mut w = self.quota_window_secs.lock().await;
+        // Keep the largest window seen: every refusal in a day reports the same
+        // reset boundary, and a stale shorter value would understate it.
+        *w = Some((*w).unwrap_or(0).max(secs));
     }
 
     /// SOCKS5 proxy URLs of every tunnel in the pool.
@@ -902,7 +951,14 @@ impl WarpPool {
         let pool_watchdog = self.clone();
         let watchdog_shutdown = shutdown.clone();
         handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            // 15s, not 60s: a tunnel that is bound but wedged (a frozen
+            // `usque` accepts TCP and never answers the SOCKS handshake) stays
+            // in the engine's static proxy list until the watchdog replaces it.
+            // Every request that draws that exit pays the engine's hardcoded
+            // 10s handshake timeout (measured: `anon:transport:10009ms`), so the
+            // detection window IS the cost. A pass now costs one 8s probe
+            // because the probes run concurrently, which keeps 15s safe.
+            let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
             interval.tick().await; // skip initial immediate tick
             while !watchdog_shutdown.load(Ordering::Relaxed) {
                 interval.tick().await;
@@ -958,6 +1014,69 @@ impl WarpPool {
         }
     }
 
+    /// The quota scope of an egress address: an IPv6 `/64` or an IPv4 `/32`.
+    ///
+    /// The free tier meters per block, not per address, so two tunnels holding
+    /// different `/128`s inside one `/64` share a bucket. Comparing raw
+    /// addresses reports them as distinct and silently overstates capacity.
+    /// Returns `None` for anything that does not parse, so an unknown address
+    /// never looks like a match.
+    fn egress_scope(ip: &str) -> Option<String> {
+        let ip = ip.trim();
+        if ip.contains(':') {
+            // Expand `::` into its eight groups, then keep the first four.
+            let (head, tail) = match ip.split_once("::") {
+                Some((h, t)) => (h, Some(t)),
+                None => (ip, None),
+            };
+            let head: Vec<&str> = head.split(':').filter(|s| !s.is_empty()).collect();
+            let tail: Vec<&str> = tail
+                .map(|t| t.split(':').filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default();
+            // An embedded IPv4 tail (`::ffff:1.2.3.4`) is not a scope we can
+            // reason about here; treat it as unparseable rather than guess.
+            if ip.contains('.') {
+                return None;
+            }
+            // `::` stands for however many zero groups are needed to reach
+            // eight; that count depends on both sides, so it is only correct to
+            // compute it from their lengths together.
+            // `::` present but the explicit groups already fill the address is
+            // malformed rather than a zero-run, hence `?`.
+            let missing = if ip.contains("::") {
+                8usize.checked_sub(head.len() + tail.len())?
+            } else {
+                0
+            };
+            // Parse every group as hex and re-render it canonically: `0008` and
+            // `8` are the same group, and a non-hex group is not an address at
+            // all. Comparing the raw text would call those distinct.
+            let mut groups: Vec<u16> = Vec::with_capacity(8);
+            for g in head.iter() {
+                groups.push(u16::from_str_radix(g, 16).ok()?);
+            }
+            groups.extend(std::iter::repeat_n(0, missing));
+            for g in tail.iter() {
+                groups.push(u16::from_str_radix(g, 16).ok()?);
+            }
+            if groups.len() != 8 {
+                return None;
+            }
+            let head_scope: Vec<String> = groups[..4].iter().map(|g| format!("{g:x}")).collect();
+            Some(format!("{}/64", head_scope.join(":")))
+        } else {
+            let mut parts = ip.split('.');
+            let octets: Vec<&str> = parts.by_ref().take(4).collect();
+            if octets.len() != 4 || parts.next().is_some() {
+                return None;
+            }
+            if octets.iter().any(|o| o.parse::<u8>().is_err()) {
+                return None;
+            }
+            Some(ip.to_string())
+        }
+    }
+
     /// Returns the indices of tunnels whose egress IP is shared with an earlier
     /// tunnel, if any.
     ///
@@ -976,11 +1095,14 @@ impl WarpPool {
                 }
                 st.ip.clone()
             };
-            if let Some(ip) = ip {
-                if seen.contains(&ip) {
+            // Compare quota scopes, not addresses: two `/128`s inside one
+            // `/64` are one bucket, and treating them as distinct is what
+            // let a rotation land back on a spent block unnoticed.
+            if let Some(scope) = ip.as_deref().and_then(Self::egress_scope) {
+                if seen.contains(&scope) {
                     duplicates.push(t.index);
                 } else {
-                    seen.push(ip);
+                    seen.push(scope);
                 }
             }
         }
@@ -1012,12 +1134,43 @@ impl WarpPool {
             return;
         }
 
+        // Probe every tunnel concurrently.
+        //
+        // Serially, one hung exit (a frozen `usque` accepts the TCP connection
+        // and never answers the SOCKS handshake) costs the full probe timeout
+        // before the next tunnel is even looked at, so a single dead tunnel
+        // stretched a pass past a minute. Concurrently, a pass costs one probe
+        // timeout no matter how many tunnels are wedged, which is what lets the
+        // watchdog run on a short interval without passes overlapping.
+        let mut probes = tokio::task::JoinSet::new();
+        for tunnel in &self.tunnels {
+            if tunnel.recycling.load(Ordering::Relaxed) {
+                continue;
+            }
+            let t = tunnel.clone();
+            probes.spawn(async move {
+                let index = t.index;
+                (index, t.probe_ip().await)
+            });
+        }
+
+        let mut results: std::collections::HashMap<usize, Option<String>> =
+            std::collections::HashMap::new();
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, res)) = joined {
+                results.insert(index, res);
+            }
+        }
+
         for tunnel in &self.tunnels {
             if tunnel.recycling.load(Ordering::Relaxed) {
                 continue;
             }
 
-            let probe_res = tunnel.probe_ip().await;
+            let probe_res = match results.get(&tunnel.index) {
+                Some(res) => res.clone(),
+                None => continue,
+            };
             let mut st = tunnel.state.lock().await;
             match probe_res {
                 Some(ip) => {
@@ -1274,7 +1427,44 @@ impl WarpPool {
                             st.probe_completed = true;
                         }
 
+                        // A rotation that lands on a scope another tunnel
+                        // already holds buys no quota: the free tier meters per
+                        // /64 (or /32), so the replacement is a new address in a
+                        // spent bucket. Detect it here and report it honestly
+                        // instead of counting it as fresh capacity.
+                        let new_scope = new_ip.as_deref().and_then(Self::egress_scope);
+                        let collides = match new_scope {
+                            Some(scope) => {
+                                let mut held = false;
+                                for other in &self.tunnels {
+                                    if other.index == tunnel.index {
+                                        continue;
+                                    }
+                                    let st = other.state.lock().await;
+                                    if st.probe_completed
+                                        && st.ip.as_deref().and_then(Self::egress_scope)
+                                            == Some(scope.clone())
+                                    {
+                                        held = true;
+                                        break;
+                                    }
+                                }
+                                held
+                            }
+                            None => false,
+                        };
+
                         match new_ip.clone() {
+                            Some(ip) if collides => {
+                                warn!(
+                                    "Tunnel {} recycled onto {} which shares a quota scope with \
+                                     another tunnel ({} -> {}); not counted as a rotation",
+                                    tunnel.index,
+                                    ip,
+                                    old_ip.as_deref().unwrap_or("?"),
+                                    ip
+                                );
+                            }
                             Some(ip) if Some(&ip) != old_ip.as_ref() => {
                                 info!(
                                     "Tunnel {} recycled: {} -> {}",
@@ -1427,6 +1617,18 @@ impl WarpPool {
                 Vec::new()
             },
             rotations: self.rotations.load(Ordering::Relaxed),
+            scopes: {
+                let mut seen: Vec<String> = Vec::new();
+                for t in &tunnels {
+                    if let Some(scope) = t.ip.as_deref().and_then(Self::egress_scope) {
+                        if !seen.contains(&scope) {
+                            seen.push(scope);
+                        }
+                    }
+                }
+                seen.len()
+            },
+            quota_window_secs: *self.quota_window_secs.lock().await,
             tunnels,
             history: self.history.lock().await.clone(),
         }
@@ -1563,7 +1765,7 @@ fn build_probe_client(socks_port: u16) -> Option<reqwest::Client> {
     match reqwest::Client::builder()
         .proxy(proxy)
         .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(8))
+        .timeout(PROBE_TIMEOUT)
         .build()
     {
         Ok(c) => Some(c),
@@ -1853,6 +2055,95 @@ mod tests {
         assert_eq!(duplicates, vec![1, 2]);
     }
 
+    #[test]
+    fn egress_scope_truncates_ipv6_to_the_metered_block() {
+        // Two different /128s in one /64 are one quota bucket, which is the
+        // whole reason duplicates have to be compared by scope.
+        assert_eq!(
+            WarpPool::egress_scope("2a09:bac1:6500:8::3c1:47").as_deref(),
+            Some("2a09:bac1:6500:8/64")
+        );
+        assert_eq!(
+            WarpPool::egress_scope("2a09:bac1:6500:8::1f1:21a").as_deref(),
+            Some("2a09:bac1:6500:8/64")
+        );
+        // A different /64 must not collide, even though the prefix looks close.
+        assert_ne!(
+            WarpPool::egress_scope("2a09:bac1:6500:8::1"),
+            WarpPool::egress_scope("2a09:bac1:6560:8::1")
+        );
+        // Full, uncompressed form must resolve to the same scope.
+        assert_eq!(
+            WarpPool::egress_scope("2a09:bac1:6500:0008:0000:0000:0000:0001").as_deref(),
+            Some("2a09:bac1:6500:8/64")
+        );
+        // Upper-case input is not distinct.
+        assert_eq!(
+            WarpPool::egress_scope("2A09:BAC1:6500:8::1"),
+            WarpPool::egress_scope("2a09:bac1:6500:8::1")
+        );
+    }
+
+    #[test]
+    fn egress_scope_keeps_ipv4_whole() {
+        assert_eq!(
+            WarpPool::egress_scope("104.28.222.43").as_deref(),
+            Some("104.28.222.43")
+        );
+        assert_ne!(
+            WarpPool::egress_scope("104.28.222.43"),
+            WarpPool::egress_scope("104.28.222.46")
+        );
+    }
+
+    #[test]
+    fn egress_scope_rejects_what_it_cannot_parse() {
+        // Unparseable input must be `None`, never a bogus scope that would
+        // make two unrelated tunnels look like a duplicate.
+        for bad in [
+            "",
+            "not-an-ip",
+            "1.2.3",
+            "1.2.3.4.5",
+            "::ffff:1.2.3.4",
+            "2a09::gg::1",
+        ] {
+            assert_eq!(WarpPool::egress_scope(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_tunnels_compares_the_quota_block_not_the_address() {
+        // Regression: two /128s in one /64 used to be reported as distinct,
+        // which overstated the pool's real capacity by one whole bucket.
+        let pool = pool_with(2);
+        for (tunnel, ip) in [
+            (&pool.tunnels[0], "2a09:bac1:6500:8::3c1:47"),
+            (&pool.tunnels[1], "2a09:bac1:6500:8::1f1:21a"),
+        ] {
+            let mut st = tunnel.state.lock().await;
+            st.ip = Some(ip.into());
+            st.probe_completed = true;
+        }
+
+        assert_eq!(pool.duplicate_tunnels().await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_tunnels_keeps_separate_blocks_apart() {
+        let pool = pool_with(2);
+        for (tunnel, ip) in [
+            (&pool.tunnels[0], "2a09:bac1:6500:8::3c1:47"),
+            (&pool.tunnels[1], "2a09:bac1:6560:8::3e6:82"),
+        ] {
+            let mut st = tunnel.state.lock().await;
+            st.ip = Some(ip.into());
+            st.probe_completed = true;
+        }
+
+        assert!(pool.duplicate_tunnels().await.is_empty());
+    }
+
     #[tokio::test]
     async fn duplicate_tunnels_ignores_tunnels_that_have_not_probed_yet() {
         let pool = pool_with(2);
@@ -1954,6 +2245,72 @@ mod tests {
         assert!(claimed.index == 0 || claimed.index == 1);
         claimed.recycling.store(false, Ordering::SeqCst);
         let _ = idle;
+    }
+
+    /// A watchdog pass must cost one probe timeout, not one per wedged tunnel.
+    ///
+    /// This is the property that makes a 15s interval safe. With the probes run
+    /// serially, N frozen `usque` processes cost N x probe-timeout, so a pass
+    /// could not finish inside its own interval and the detection window (and
+    /// with it the 10s handshake timeout every request on that exit pays) grew
+    /// with the pool size.
+    ///
+    /// Proven by timing: the test pool has no real `usque` behind it, so every
+    /// probe fails. Run concurrently, four dead tunnels must finish in roughly
+    /// the time of one, not four.
+    #[tokio::test]
+    async fn a_watchdog_pass_probes_the_pool_concurrently() {
+        // Bind real listeners that accept and then say nothing, which is
+        // exactly what a frozen `usque` looks like from the SOCKS side: the TCP
+        // connect succeeds, the handshake never answers. A closed port would
+        // fail in microseconds and prove nothing about serialisation.
+        let mut listeners = Vec::new();
+        for _ in 0..4 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            listeners.push(l);
+        }
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+
+        // Hold every accepted connection open without replying.
+        let mut held = Vec::new();
+        for l in listeners {
+            held.push(tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((sock, _)) = l.accept().await {
+                    conns.push(sock);
+                }
+            }));
+        }
+
+        let pool = Arc::new(WarpPool::new(
+            ports,
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        ));
+
+        let started = std::time::Instant::now();
+        pool.auto_heal_dead_tunnels().await;
+        let elapsed = started.elapsed();
+
+        for h in held {
+            h.abort();
+        }
+
+        // A wedged exit costs two probe timeouts (the probe tries two URLs), so
+        // a concurrent pass over four of them is ~6s and a serial one would be
+        // ~24s. The bound sits between the two with room either side: the
+        // assertion is "not serial", not a timing measurement, so it must not
+        // flake when the runner is slow.
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "four wedged tunnels took {elapsed:?}: probes are running serially"
+        );
     }
 
     #[tokio::test]
@@ -2144,5 +2501,65 @@ mod tests {
         );
         assert_eq!(pool.protocol, WarpProtocol::WireGuard);
         assert!(pool.tunnels[0].conf_path.ends_with("wireproxy.conf"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_scopes_not_just_tunnel_count() {
+        // The whole point of the field: `healthy` counts tunnels, `scopes`
+        // counts metered blocks, and the gap between them is lost capacity.
+        let pool = pool_with(3);
+        for (tunnel, ip) in [
+            (&pool.tunnels[0], "2a09:bac1:6500:8::3c1:47"),
+            (&pool.tunnels[1], "2a09:bac1:6500:8::1f1:21a"),
+            (&pool.tunnels[2], "2a09:bac1:6560:8::3e6:82"),
+        ] {
+            let mut st = tunnel.state.lock().await;
+            st.ip = Some(ip.into());
+            st.probe_completed = true;
+            st.healthy = true;
+        }
+
+        let status = pool.status().await;
+        assert_eq!(status.healthy, 3, "all three tunnels answer their probe");
+        assert_eq!(status.scopes, 2, "two of them share one /64");
+        assert_eq!(status.quota_window_secs, None);
+
+        pool.note_quota_window(61238).await;
+        pool.note_quota_window(3600).await;
+        assert_eq!(
+            pool.status().await.quota_window_secs,
+            Some(61238),
+            "the largest window must win: a shorter later value understates it"
+        );
+    }
+
+    /// The exact ten egress addresses the production pool held on 2026-10-30.
+    ///
+    /// Ten tunnels, eight blocks: two pairs shared a `/64` while every address
+    /// was unique, which is the failure this helper exists to catch. Pinning the
+    /// real sample keeps the comparison honest against a future refactor that
+    /// "simplifies" it back to string equality.
+    #[test]
+    fn the_real_pool_of_ten_tunnels_held_only_eight_blocks() {
+        let ips = [
+            "2a09:bac5:55ff:25c3::3c3:1d",
+            "2a09:bac5:55fb:18c8::278:79",
+            "2a09:bac1:6500:8::3c1:47",
+            "2a09:bac1:6560:8::3e6:82",
+            "2a09:bac5:55fc:25b9::3c2:8",
+            "2a09:bac5:55fb:25cd::3c4:41",
+            "2a09:bac5:55fd:18be::277:61",
+            "2a09:bac1:6560:8::1f1:200",
+            "2a09:bac5:55fd:25c3::3c3:3c",
+            "2a09:bac1:6500:8::1f1:21a",
+        ];
+        let mut scopes: Vec<String> = Vec::new();
+        for ip in ips {
+            let scope = WarpPool::egress_scope(ip).expect("a real egress address must parse");
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        assert_eq!(scopes.len(), 8, "expected 8 blocks, got {scopes:?}");
     }
 }

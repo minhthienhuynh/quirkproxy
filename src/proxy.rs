@@ -264,6 +264,23 @@ pub async fn trigger_rotate_next(
     }
 }
 
+/// Reads `retry-after` as a number of seconds.
+///
+/// Only the delta-seconds form is parsed: it is what this upstream emits
+/// (measured `retry-after: 48940`), and an HTTP-date would have to be resolved
+/// against the local clock, which is exactly the kind of guess that turns a
+/// quota verdict into a rotation. Returns `None` when the header is absent or
+/// carries something unparseable.
+fn retry_after_secs(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// Generates a fast, cryptographically unique OpenCode CLI 2.x session ID
 /// Format: ses_<12-hex-inverted-timestamp><14-base62-random>
 ///
@@ -455,7 +472,6 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             let res_headers = res.headers().clone();
             let err_bytes = res.bytes().await.unwrap_or_default();
             let err_text = String::from_utf8_lossy(&err_bytes);
-
             // A 403 is not one condition. Only some causes are fixed by a new
             // egress address; rotating for a shape/geo/auth refusal spends a
             // registration and ~5s while guaranteeing the same failure.
@@ -465,11 +481,43 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 None
             };
 
+            // A 429 is not automatically worth an egress swap. The free bucket
+            // is spent per /32, and a `retry-after` measured in hours is the
+            // upstream saying that address is done for the day — a fresh WARP
+            // registration lands in the same colo pool and, measured on this
+            // host, kept coming back on the same few /32s while every rotation
+            // spent 30-90s draining live streams. Rotating on a long window
+            // therefore buys latency, not quota: report the 429 instead and let
+            // the caller (or the pool's own quota rotation) deal with it.
+            let long_quota_window = is_429
+                && retry_after_secs(&res_headers)
+                    .is_some_and(|s| s > state.config.warp_quota_rotate_max_window);
+
             let should_rotate = match (is_429, refusal) {
-                (true, _) => state.config.warp_auto_rotate_429,
+                (true, _) => state.config.warp_auto_rotate_429 && !long_quota_window,
                 (false, Some(kind)) => state.config.warp_auto_rotate_403 && kind.rotate_eligible(),
                 (false, None) => false,
             };
+
+            if long_quota_window {
+                warn!(
+                    "429 carries a retry-after of {}s (> {}s): not rotating, \
+                     this egress is out of free quota for the day",
+                    retry_after_secs(&res_headers).unwrap_or_default(),
+                    state.config.warp_quota_rotate_max_window
+                );
+                // Record the window pool-wide. The supervisor never learns
+                // which tunnel served the refused request (the engine picks the
+                // proxy per attempt), so attributing the verdict to one tunnel
+                // would be a guess. What is knowable is that *some* egress is
+                // spent for this long, and that every egress shares the same
+                // reset boundary — so the quota is reported as a pool state,
+                // not invented per tunnel.
+                state
+                    .warp
+                    .note_quota_window(retry_after_secs(&res_headers).unwrap_or_default())
+                    .await;
+            }
 
             if is_403 {
                 if let Some(kind) = refusal {
@@ -652,6 +700,9 @@ mod tests {
             warp_enabled: false,
             warp_protocol: crate::config::WarpProtocol::WireGuard,
             warp_auto_rotate_429: false,
+            max_anonymous_exits: 1,
+            free_tier_block_seconds: 900,
+            warp_quota_rotate_max_window: 3600,
             warp_auto_rotate_403: false,
             warp_state_dir: "/tmp".into(),
             max_retries: 1,

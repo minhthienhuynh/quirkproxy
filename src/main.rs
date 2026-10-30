@@ -114,8 +114,13 @@ fn ensure_opencode2api_config(config: &Config) -> Result<()> {
             "go": "https://opencode.ai/zen/go",
             "anonymous": "https://opencode.ai/inference"
         },
+        // MAX_RETRIES is the operator's one dial for "how many upstream
+        // attempts may one request cost". It used to configure only the
+        // supervisor's own loop while the engine quietly kept its built-in 3,
+        // so setting MAX_RETRIES=1 still produced multi-leg requests. Forward
+        // it instead of hardcoding a second, invisible limit.
         "retry": {
-            "max_attempts": 3,
+            "max_attempts": config.max_retries.max(1),
             "timeout_seconds": 180
         },
         "models": {
@@ -127,7 +132,14 @@ fn ensure_opencode2api_config(config: &Config) -> Result<()> {
             "max_idle_conns_per_host": 64,
             "idle_conn_timeout_seconds": 60,
             "connect_timeout_seconds": 10,
-            "failure_cooldown_seconds": 15
+            "failure_cooldown_seconds": 15,
+            // The engine's own default is 8 exits per anonymous request no
+            // matter how small the pool is, so a spent bucket cost 8 legs
+            // (~5-6s measured) to report a verdict the first leg already had.
+            // Bound the walk to the pool and keep a flagged exit out of the
+            // cursor for the rest of that verdict.
+            "max_anonymous_exits": config.max_anonymous_exits,
+            "free_tier_block_seconds": config.free_tier_block_seconds
         },
         "logging": {
             "level": "info",
