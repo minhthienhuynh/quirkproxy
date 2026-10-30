@@ -44,7 +44,7 @@ ENV WARP_AUTO_ROTATE_429=true
 ENV WARP_AUTO_ROTATE_403=true
 ENV OPENCODE2API_BIN=/usr/local/bin/opencode2api
 ENV OPENCODE2API_CONFIG=/app/config.json
-ENV OPENCODE2API_VERSION=v1.4.5
+ENV OPENCODE2API_VERSION=v1.4.6
 ENV WGCF_VERSION=v2.3.1
 ENV WIREPROXY_VERSION=v1.1.3
 ENV USQUE_VERSION=v4.2.1
@@ -99,8 +99,8 @@ RUN ARCH=$(dpkg --print-architecture) \
 # 3. Download official opencode2api release binary
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
-         amd64) OPENCODE_SHA256="469ea7ab6eb38d409378748721607daef55a770b92cc9e2466a5aad81639fcf2" ;; \
-         arm64) OPENCODE_SHA256="6a34a93026e4d91a3e55cbe04bc387a94dffaafaa606caef5ed01fa3c5248a98" ;; \
+         amd64) OPENCODE_SHA256="335d15fdfb2aec3d14ef6c2f9abc08e6d9b18d2e29c1e65e523105d6b2bdcbd0" ;; \
+         arm64) OPENCODE_SHA256="d45ac6b8bd19e5e7c285a344f2e5b03ef60fba00418e36b7cdad1d6695b1fd89" ;; \
          *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
        esac \
     && echo "Downloading opencode2api ${OPENCODE2API_VERSION} for ${ARCH}..." \
