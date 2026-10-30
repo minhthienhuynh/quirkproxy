@@ -61,7 +61,7 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 | `WARP_AUTO_ROTATE_403` | `true` | Recycle a tunnel on a rotation-eligible `403` |
 | `MAX_RETRIES` | `1` with a multi-identity pool, else `3` | Upstream attempts per client request. Forwarded to the engine as `retry.max_attempts`; it used to configure only the supervisor's own loop. |
 | `MAX_ANONYMOUS_EXITS` | `8` | How many distinct exits one anonymous request may walk inside the engine. This **bounds** the walk: raising it costs legs and latency (measured 10 → mean 5.51 legs / 4625 ms vs 3.15 / 2650 ms), and lowering it turns refusals into the client's problem (3 → 8 of 15 requests `429`). |
-| `FREE_TIER_BLOCK_SECONDS` | `900` | How long an exit that answered `429` stays out of the engine's anonymous cursor, so a request cannot walk back onto it. |
+| `FREE_TIER_BLOCK_SECONDS` | `900` | How long an exit that answered a **`403` IP-block** stays out of the engine's anonymous cursor. Note this is the engine's `freeTierBlockTTL`, reached only via `peekNetworkAbuseBlock`: it does not apply to `429` quota refusals. |
 | `WARP_QUOTA_ROTATE_MAX_WINDOW` | `3600` | A `429` whose `retry-after` exceeds this many seconds is a spent daily bucket, not a queue hiccup: it is reported instead of triggering a rotation that would only drain live streams. |
 | `UPSTREAM_API` | `http://127.0.0.1:18088` | Base URL of the `opencode2api` engine |
 | `SERVER_KEY` | `local-test-key` | Bearer token for `POST /v1/rotate` |
@@ -97,6 +97,20 @@ boot and reused afterwards. Without it, every container restart would register
 new identities and rotate all egress IPs.
 
 ### Endpoints
+
+### Repeated `429` on a spent model: reported, not walked
+
+When a model's daily bucket is exhausted, every exit answers the same `429`. The
+engine still walks its anonymous exits one by one (~700 ms per leg, up to 8 legs)
+looking for one that works, so the client waits ~6 s to be told what the first
+leg already knew.
+
+The supervisor therefore remembers the daily-quota window per **model** (quota is
+metered per model, not per pool: in production `beam-free` kept answering `200`
+while `deepseek-v4.1-flash-free` was refused for 14.6 h) and answers immediately
+with the same `429` plus the upstream's `retry-after`. Measured on the same pool:
+**6431 ms → 1 ms**. A model with quota left never inherits another model's
+verdict, and any successful request clears that model's verdict.
 
 - `GET /healthz` — Liveness & status. `status` is `healthy` (engine ready), `warming` (engine reachable, catalog still loading) or `degraded` (engine unreachable). Reports `inflight`, `engine_models`, and `warp.{identities,healthy,scopes,quota_window_secs,tunnels[]}` where each tunnel carries its own `ip` / `healthy` / `recycling`. There is no top-level egress IP: with a pool there is no single answer. `scopes` is the number that bounds capacity — the free tier meters per `/64` (IPv6) or `/32` (IPv4), so ten healthy tunnels can be eight buckets, and the gap is lost allowance rather than a cosmetic duplicate.
 - `POST /v1/rotate` — Rotate every tunnel in the pool. Requires `Authorization: Bearer $SERVER_KEY`. Drains in-flight streams first.

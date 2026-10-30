@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -76,6 +77,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// every request that draws one pays the engine's hardcoded 10s SOCKS handshake
 /// timeout (measured: `anon:transport:10009ms`).
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Upper bound on remembered per-model quota verdicts.
+///
+/// The map is keyed by client-supplied model names, so it must not grow without
+/// limit: expired entries are dropped first, and a still-overfull map loses its
+/// oldest key. Bounding it costs at worst one wasted walk per forgotten model.
+const QUOTA_WINDOW_MODEL_CAP: usize = 256;
 /// A tunnel that ran this long before dying is restarted immediately instead
 /// of with backoff (crash loop vs. one-off crash).
 const TUNNEL_STABLE_UPTIME: Duration = Duration::from_secs(30);
@@ -764,15 +772,14 @@ pub struct WarpPool {
     recycle_lock: Mutex<()>,
     rotations: AtomicUsize,
     history: Mutex<Vec<RotateRecord>>,
-    /// `retry-after` (seconds) of the last 429 that outlived
-    /// `WARP_QUOTA_ROTATE_MAX_WINDOW`, if any.
+    /// Per-model daily-quota verdicts: the window each model was last refused
+    /// in, and when that verdict was observed.
     ///
-    /// The supervisor cannot attribute an upstream refusal to one tunnel: the
-    /// engine picks the proxy per attempt and reports only the status. What it
-    /// can state is that *some* egress is out of free quota for the rest of the
-    /// window, which is what a caller needs in order to stop retrying into the
-    /// same daily verdict.
-    quota_window_secs: Mutex<Option<u64>>,
+    /// Keyed by model because quota is metered per model, not per pool: refusing
+    /// `big-pickle` because `deepseek-v4.1-flash-free` ran out would deny a
+    /// model that still answers 200 (measured: the pool served `beam-free`
+    /// throughout while `deepseek` was refused).
+    quota_windows: Mutex<HashMap<String, (u64, Instant)>>,
 }
 
 impl WarpPool {
@@ -824,17 +831,58 @@ impl WarpPool {
             recycle_lock: Mutex::new(()),
             rotations: AtomicUsize::new(0),
             history: Mutex::new(Vec::new()),
-            quota_window_secs: Mutex::new(None),
+            quota_windows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Seconds left in a daily-quota window the pool has already been refused
+    /// in, or `None` when no such verdict is live.
+    ///
+    /// While it is live every exit answers the same `429` (measured: 10/10
+    /// exits, `retry-after` ~14.6h), so walking the pool spends one ~700ms leg
+    /// per exit -- up to 8 legs, ~6s of client latency -- to reach a verdict the
+    /// first refusal already established. Reporting it immediately returns the
+    /// same refusal in milliseconds.
+    ///
+    /// Conservative by construction: bounded by the wall-clock window the
+    /// upstream itself named, and cleared by any successful request, so a single
+    /// stale observation cannot pin the pool shut for the day.
+    pub async fn quota_window_remaining(&self, model: &str) -> Option<u64> {
+        let windows = self.quota_windows.lock().await;
+        let (secs, at) = windows.get(model)?;
+        let elapsed = at.elapsed().as_secs();
+        if elapsed < *secs {
+            Some(secs - elapsed)
+        } else {
+            None
+        }
+    }
+
+    /// Clears the recorded quota window after an exit served a request, so a
+    /// recovered pool is not held shut by a stale verdict.
+    pub async fn clear_quota_window(&self, model: &str) {
+        self.quota_windows.lock().await.remove(model);
     }
 
     /// Records that some egress answered a 429 whose `retry-after` outlives
     /// `WARP_QUOTA_ROTATE_MAX_WINDOW`, i.e. a spent daily bucket.
-    pub async fn note_quota_window(&self, secs: u64) {
-        let mut w = self.quota_window_secs.lock().await;
-        // Keep the largest window seen: every refusal in a day reports the same
-        // reset boundary, and a stale shorter value would understate it.
-        *w = Some((*w).unwrap_or(0).max(secs));
+    pub async fn note_quota_window(&self, model: &str, secs: u64) {
+        let mut windows = self.quota_windows.lock().await;
+        // Keep the largest window seen per model: every refusal in a day reports
+        // the same reset boundary, and a stale shorter value would understate it.
+        let observed = windows.get(model).map(|(w, _)| *w).unwrap_or(0);
+        windows.insert(model.to_string(), (observed.max(secs), Instant::now()));
+        // Bound the map: it is keyed by whatever model names clients send, and an
+        // unbounded one would leak memory on a hostile or buggy client.
+        if windows.len() > QUOTA_WINDOW_MODEL_CAP {
+            windows.retain(|_, (secs, at)| at.elapsed().as_secs() < *secs);
+            while windows.len() > QUOTA_WINDOW_MODEL_CAP {
+                let Some(victim) = windows.keys().next().cloned() else {
+                    break;
+                };
+                windows.remove(&victim);
+            }
+        }
     }
 
     /// SOCKS5 proxy URLs of every tunnel in the pool.
@@ -1628,7 +1676,17 @@ impl WarpPool {
                 }
                 seen.len()
             },
-            quota_window_secs: *self.quota_window_secs.lock().await,
+            quota_window_secs: {
+                // The documented field is a single pool-level number; report the
+                // longest live window so a caller sizing its backoff is not
+                // surprised by a shorter one.
+                let windows = self.quota_windows.lock().await;
+                windows
+                    .values()
+                    .filter(|(secs, at)| at.elapsed().as_secs() < *secs)
+                    .map(|(secs, at)| secs - at.elapsed().as_secs())
+                    .max()
+            },
             tunnels,
             history: self.history.lock().await.clone(),
         }
@@ -2504,6 +2562,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recorded_quota_window_expires_and_is_cleared_by_success() {
+        let pool = pool_with(2);
+        const M: &str = "deepseek-v4.1-flash-free";
+        assert_eq!(
+            pool.quota_window_remaining(M).await,
+            None,
+            "nothing recorded yet"
+        );
+
+        // A window in the future is live, and the remaining seconds shrink.
+        pool.note_quota_window(M, 600).await;
+        let left = pool
+            .quota_window_remaining(M)
+            .await
+            .expect("window must be live");
+        assert!(left <= 600 && left > 590, "expected ~600s left, got {left}");
+
+        // A successful request clears it: a recovered pool must not stay shut.
+        pool.clear_quota_window(M).await;
+        assert_eq!(pool.quota_window_remaining(M).await, None);
+
+        // An already-expired window is not live either. Recording a 1s window
+        // and waiting it out proves the bound is the upstream's own retry-after
+        // rather than "remembered forever".
+        pool.note_quota_window(M, 1).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            pool.quota_window_remaining(M).await,
+            None,
+            "an expired window must not keep refusing traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_longer_window_extends_the_remaining_time() {
+        let pool = pool_with(1);
+        const M: &str = "beam-free";
+        pool.note_quota_window(M, 60).await;
+        let short = pool.quota_window_remaining(M).await.unwrap();
+        pool.note_quota_window(M, 600).await;
+        let long = pool.quota_window_remaining(M).await.unwrap();
+        assert!(
+            long > short,
+            "a longer retry-after must win: {long} should exceed {short}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_model_running_out_does_not_refuse_another() {
+        // Measured in production: the pool kept serving `beam-free` with 200
+        // while `deepseek-v4.1-flash-free` was refused with a 14.6h window.
+        // Quota is metered per model, so a pool-wide verdict would deny a model
+        // that still works -- the worst failure mode this short-circuit can have.
+        let pool = pool_with(2);
+        pool.note_quota_window("deepseek-v4.1-flash-free", 52_000)
+            .await;
+
+        assert!(
+            pool.quota_window_remaining("deepseek-v4.1-flash-free")
+                .await
+                .is_some(),
+            "the spent model must be refused"
+        );
+        assert_eq!(
+            pool.quota_window_remaining("beam-free").await,
+            None,
+            "a model with quota left must never inherit another model's verdict"
+        );
+    }
+
+    #[tokio::test]
     async fn status_reports_scopes_not_just_tunnel_count() {
         // The whole point of the field: `healthy` counts tunnels, `scopes`
         // counts metered blocks, and the gap between them is lost capacity.
@@ -2524,12 +2653,12 @@ mod tests {
         assert_eq!(status.scopes, 2, "two of them share one /64");
         assert_eq!(status.quota_window_secs, None);
 
-        pool.note_quota_window(61238).await;
-        pool.note_quota_window(3600).await;
-        assert_eq!(
-            pool.status().await.quota_window_secs,
-            Some(61238),
-            "the largest window must win: a shorter later value understates it"
+        pool.note_quota_window("beam-free", 61238).await;
+        pool.note_quota_window("beam-free", 3600).await;
+        let reported = pool.status().await.quota_window_secs;
+        assert!(
+            reported.is_some_and(|s| s <= 61238 && s > 61200),
+            "the largest window must win and be reported as time remaining, got {reported:?}"
         );
     }
 

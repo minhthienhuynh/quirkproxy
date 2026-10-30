@@ -319,6 +319,16 @@ fn make_session_id() -> String {
     format!("ses_{}{}", hex_ts, rand_b62)
 }
 
+/// The `model` field of a JSON request body, if it has one.
+///
+/// Quota is metered per model upstream, so the verdicts recorded here are keyed
+/// by it. A body that is not JSON, or that omits `model` (e.g. `/v1/models`),
+/// yields `None` and simply forgoes the short-circuit rather than guessing.
+fn request_model(body: &Bytes) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("model")?.as_str().map(|m| m.to_string())
+}
+
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
     let permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -409,6 +419,35 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+
+    // A pool that is already inside a daily-quota window answers every exit with
+    // the same 429 (measured: 10/10 exits, retry-after ~14.6h). Walking it costs
+    // one ~700ms leg per exit -- up to 8 legs, 6s of client latency -- to reach a
+    // verdict the first refusal already established. Report it immediately
+    // instead, carrying the upstream's own retry-after so the caller still knows
+    // when to come back.
+    let request_model = request_model(&body_bytes);
+    if let (Some(secs), Some(model)) = (
+        state
+            .warp
+            .quota_window_remaining(request_model.as_deref().unwrap_or_default())
+            .await,
+        request_model.clone(),
+    ) {
+        warn!("Model {model} is inside a {secs}s daily-quota window: refusing without walking an exit");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, HeaderValue::from(secs))],
+            Json(json!({
+                "error": {
+                    "message": "Free usage limit reached for every egress in the pool; \
+                                retrying another exit cannot succeed until the window resets",
+                    "type": "free_usage_limit"
+                }
+            })),
+        )
+            .into_response();
+    }
 
     let max_retries = if state.warp.enabled()
         && (state.config.warp_auto_rotate_429 || state.config.warp_auto_rotate_403)
@@ -513,10 +552,15 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 // spent for this long, and that every egress shares the same
                 // reset boundary — so the quota is reported as a pool state,
                 // not invented per tunnel.
-                state
-                    .warp
-                    .note_quota_window(retry_after_secs(&res_headers).unwrap_or_default())
-                    .await;
+                if let Some(model) = request_model.as_deref() {
+                    state
+                        .warp
+                        .note_quota_window(
+                            model,
+                            retry_after_secs(&res_headers).unwrap_or_default(),
+                        )
+                        .await;
+                }
             }
 
             if is_403 {
@@ -570,6 +614,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
             // Return upstream error response if cannot rotate or exhausted retries
             return build_response(status, &res_headers, Body::from(err_bytes));
+        }
+
+        // An exit just served this request, so any recorded daily-quota verdict
+        // is stale: clear it or the short-circuit above would keep refusing a
+        // pool that has quota again.
+        if let Some(model) = request_model.as_deref() {
+            state.warp.clear_quota_window(model).await;
         }
 
         // Success or normal response -> stream back.
