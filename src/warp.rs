@@ -57,6 +57,25 @@ const TUNNEL_STREAM_MIN_AGE: Duration = Duration::from_secs(3);
 const TUNNEL_QUIET_WINDOW: Duration = Duration::from_millis(250);
 /// How often the tunnel drain re-reads the socket table.
 const TUNNEL_DRAIN_POLL: Duration = Duration::from_millis(100);
+/// Per-request timeout of one egress probe.
+///
+/// Healthy exits answer in 62-159ms through the pool (measured 2026-10-30, five
+/// samples x four tunnels), so 3s leaves ~19x headroom while keeping a watchdog
+/// pass short: the probe tries two URLs, so a wedged exit costs 2 x 3s = 6s and
+/// still fits inside the 15s interval with the probes running concurrently.
+/// The previous 8s made a wedged pass cost 16s -- longer than the interval.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the background watchdog probes the pool.
+///
+/// Bounded below by a pass length rather than by cost: a pass is one concurrent
+/// probe round, and a wedged exit costs two probe timeouts (the probe tries two
+/// URLs), i.e. 6s. 15s leaves room for that without passes overlapping.
+///
+/// The interval matters because it IS the cost: an exit that is bound but wedged
+/// stays in the engine's static proxy list until the watchdog replaces it, and
+/// every request that draws one pays the engine's hardcoded 10s SOCKS handshake
+/// timeout (measured: `anon:transport:10009ms`).
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(15);
 /// A tunnel that ran this long before dying is restarted immediately instead
 /// of with backoff (crash loop vs. one-off crash).
 const TUNNEL_STABLE_UPTIME: Duration = Duration::from_secs(30);
@@ -932,7 +951,14 @@ impl WarpPool {
         let pool_watchdog = self.clone();
         let watchdog_shutdown = shutdown.clone();
         handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            // 15s, not 60s: a tunnel that is bound but wedged (a frozen
+            // `usque` accepts TCP and never answers the SOCKS handshake) stays
+            // in the engine's static proxy list until the watchdog replaces it.
+            // Every request that draws that exit pays the engine's hardcoded
+            // 10s handshake timeout (measured: `anon:transport:10009ms`), so the
+            // detection window IS the cost. A pass now costs one 8s probe
+            // because the probes run concurrently, which keeps 15s safe.
+            let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
             interval.tick().await; // skip initial immediate tick
             while !watchdog_shutdown.load(Ordering::Relaxed) {
                 interval.tick().await;
@@ -1108,12 +1134,43 @@ impl WarpPool {
             return;
         }
 
+        // Probe every tunnel concurrently.
+        //
+        // Serially, one hung exit (a frozen `usque` accepts the TCP connection
+        // and never answers the SOCKS handshake) costs the full probe timeout
+        // before the next tunnel is even looked at, so a single dead tunnel
+        // stretched a pass past a minute. Concurrently, a pass costs one probe
+        // timeout no matter how many tunnels are wedged, which is what lets the
+        // watchdog run on a short interval without passes overlapping.
+        let mut probes = tokio::task::JoinSet::new();
+        for tunnel in &self.tunnels {
+            if tunnel.recycling.load(Ordering::Relaxed) {
+                continue;
+            }
+            let t = tunnel.clone();
+            probes.spawn(async move {
+                let index = t.index;
+                (index, t.probe_ip().await)
+            });
+        }
+
+        let mut results: std::collections::HashMap<usize, Option<String>> =
+            std::collections::HashMap::new();
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, res)) = joined {
+                results.insert(index, res);
+            }
+        }
+
         for tunnel in &self.tunnels {
             if tunnel.recycling.load(Ordering::Relaxed) {
                 continue;
             }
 
-            let probe_res = tunnel.probe_ip().await;
+            let probe_res = match results.get(&tunnel.index) {
+                Some(res) => res.clone(),
+                None => continue,
+            };
             let mut st = tunnel.state.lock().await;
             match probe_res {
                 Some(ip) => {
@@ -1708,7 +1765,7 @@ fn build_probe_client(socks_port: u16) -> Option<reqwest::Client> {
     match reqwest::Client::builder()
         .proxy(proxy)
         .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(8))
+        .timeout(PROBE_TIMEOUT)
         .build()
     {
         Ok(c) => Some(c),
@@ -2188,6 +2245,72 @@ mod tests {
         assert!(claimed.index == 0 || claimed.index == 1);
         claimed.recycling.store(false, Ordering::SeqCst);
         let _ = idle;
+    }
+
+    /// A watchdog pass must cost one probe timeout, not one per wedged tunnel.
+    ///
+    /// This is the property that makes a 15s interval safe. With the probes run
+    /// serially, N frozen `usque` processes cost N x probe-timeout, so a pass
+    /// could not finish inside its own interval and the detection window (and
+    /// with it the 10s handshake timeout every request on that exit pays) grew
+    /// with the pool size.
+    ///
+    /// Proven by timing: the test pool has no real `usque` behind it, so every
+    /// probe fails. Run concurrently, four dead tunnels must finish in roughly
+    /// the time of one, not four.
+    #[tokio::test]
+    async fn a_watchdog_pass_probes_the_pool_concurrently() {
+        // Bind real listeners that accept and then say nothing, which is
+        // exactly what a frozen `usque` looks like from the SOCKS side: the TCP
+        // connect succeeds, the handshake never answers. A closed port would
+        // fail in microseconds and prove nothing about serialisation.
+        let mut listeners = Vec::new();
+        for _ in 0..4 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            listeners.push(l);
+        }
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+
+        // Hold every accepted connection open without replying.
+        let mut held = Vec::new();
+        for l in listeners {
+            held.push(tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((sock, _)) = l.accept().await {
+                    conns.push(sock);
+                }
+            }));
+        }
+
+        let pool = Arc::new(WarpPool::new(
+            ports,
+            "/tmp/quirkproxy-test-warp",
+            true,
+            WarpProtocol::WireGuard,
+        ));
+
+        let started = std::time::Instant::now();
+        pool.auto_heal_dead_tunnels().await;
+        let elapsed = started.elapsed();
+
+        for h in held {
+            h.abort();
+        }
+
+        // A wedged exit costs two probe timeouts (the probe tries two URLs), so
+        // a concurrent pass over four of them is ~6s and a serial one would be
+        // ~24s. The bound sits between the two with room either side: the
+        // assertion is "not serial", not a timing measurement, so it must not
+        // flake when the runner is slow.
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "four wedged tunnels took {elapsed:?}: probes are running serially"
+        );
     }
 
     #[tokio::test]
