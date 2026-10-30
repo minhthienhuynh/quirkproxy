@@ -59,6 +59,21 @@ pub struct Config {
     pub warp_protocol: WarpProtocol,
     /// Auto-rotate a WARP identity when receiving HTTP 429 Rate Limit (default: true)
     pub warp_auto_rotate_429: bool,
+    /// How many distinct proxy exits one anonymous request may walk inside
+    /// the engine (default: one per tunnel).
+    ///
+    /// The engine's own default is 8 regardless of pool size, so a 10-tunnel
+    /// pool let a single request burn 8 legs before reporting a verdict it
+    /// already had. Binding it to the pool keeps the walk as wide as the
+    /// capacity that actually exists.
+    pub max_anonymous_exits: usize,
+    /// How long an exit the free tier flagged stays out of the engine's
+    /// anonymous cursor (default: 900s).
+    ///
+    /// Without it, the engine walks back onto the exit that just answered 429
+    /// within the same request and spends another leg on a verdict that will
+    /// not change until the daily reset.
+    pub free_tier_block_seconds: u64,
     /// A 429 whose `retry-after` exceeds this many seconds is a spent free
     /// bucket for the rest of the day, not a queue hiccup: rotating the egress
     /// for it drains live streams for 30-90s and comes back on the same /32
@@ -138,6 +153,11 @@ impl Config {
             warp_enabled: env_bool("WARP_ENABLED", true) && warp_identities > 0,
             warp_protocol,
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
+            // One exit per tunnel: the pool is what bounds real capacity, so
+            // letting the engine walk wider than the pool only repeats
+            // verdicts on exits already known to refuse.
+            max_anonymous_exits: env_parse::<usize>("MAX_ANONYMOUS_EXITS", warp_identities.max(1)),
+            free_tier_block_seconds: env_parse("FREE_TIER_BLOCK_SECONDS", 900),
             warp_quota_rotate_max_window: env_parse("WARP_QUOTA_ROTATE_MAX_WINDOW", 3600),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
             warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
@@ -190,6 +210,8 @@ mod tests {
             warp_enabled: true,
             warp_protocol: WarpProtocol::WireGuard,
             warp_auto_rotate_429: true,
+            max_anonymous_exits: 3,
+            free_tier_block_seconds: 900,
             warp_quota_rotate_max_window: 3600,
             warp_auto_rotate_403: true,
             warp_state_dir: "/app/warp".into(),

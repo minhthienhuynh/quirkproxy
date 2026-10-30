@@ -506,6 +506,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                     retry_after_secs(&res_headers).unwrap_or_default(),
                     state.config.warp_quota_rotate_max_window
                 );
+                // Record the window pool-wide. The supervisor never learns
+                // which tunnel served the refused request (the engine picks the
+                // proxy per attempt), so attributing the verdict to one tunnel
+                // would be a guess. What is knowable is that *some* egress is
+                // spent for this long, and that every egress shares the same
+                // reset boundary — so the quota is reported as a pool state,
+                // not invented per tunnel.
+                state
+                    .warp
+                    .note_quota_window(retry_after_secs(&res_headers).unwrap_or_default())
+                    .await;
             }
 
             if is_403 {
@@ -689,6 +700,8 @@ mod tests {
             warp_enabled: false,
             warp_protocol: crate::config::WarpProtocol::WireGuard,
             warp_auto_rotate_429: false,
+            max_anonymous_exits: 1,
+            free_tier_block_seconds: 900,
             warp_quota_rotate_max_window: 3600,
             warp_auto_rotate_403: false,
             warp_state_dir: "/tmp".into(),
