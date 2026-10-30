@@ -864,6 +864,43 @@ impl WarpPool {
         self.quota_windows.lock().await.remove(model);
     }
 
+    /// Drops every recorded quota verdict, because the addresses they describe
+    /// have been replaced.
+    ///
+    /// A verdict means "this model is spent *for the egresses I hold*". A
+    /// rotation changes that premise, so keeping the verdict refuses traffic for
+    /// a pool that may have quota again. Measured: after `POST /v1/rotate`
+    /// replaced five tunnels with fresh `/64`s, every request was still refused
+    /// from the cache in ~1 ms until the window expired — real callers got a
+    /// 429 from a recovered pool, and a direct probe read the cache instead of
+    /// the upstream, making a rotation experiment look like proof that rotation
+    /// cannot help.
+    pub async fn clear_quota_windows(&self) -> usize {
+        let mut windows = self.quota_windows.lock().await;
+        let dropped = windows.len();
+        windows.clear();
+        dropped
+    }
+
+    /// Applies the quota-verdict invalidation a rotation requires.
+    ///
+    /// Only a *changed* egress invalidates the verdicts: when a re-registration
+    /// comes back on the same address the quotas are unchanged, and clearing
+    /// would buy a full walk whose only possible outcome is the same refusal.
+    pub async fn note_egress_change(&self, old_ip: Option<&str>, new_ip: Option<&str>) {
+        if let Some(new_ip) = new_ip {
+            if Some(new_ip) != old_ip {
+                let dropped = self.clear_quota_windows().await;
+                if dropped > 0 {
+                    info!(
+                        "Egress {} -> {new_ip}: dropped {dropped} quota verdict(s), they described the old address",
+                        old_ip.unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+
     /// Records that some egress answered a 429 whose `retry-after` outlives
     /// `WARP_QUOTA_ROTATE_MAX_WINDOW`, i.e. a spent daily bucket.
     pub async fn note_quota_window(&self, model: &str, secs: u64) {
@@ -1502,6 +1539,10 @@ impl WarpPool {
                             None => false,
                         };
 
+                        // `old_ip` is moved into `RotateRecord` below, so keep a
+                        // copy for the quota-verdict comparison.
+                        let old_ip_moved = old_ip.clone();
+
                         match new_ip.clone() {
                             Some(ip) if collides => {
                                 warn!(
@@ -1539,6 +1580,15 @@ impl WarpPool {
                             ),
                             None => warn!("Tunnel {}: could not verify a new egress IP.", tunnel.index),
                         }
+
+                        // A rotation that changed the egress invalidates every
+                        // recorded quota verdict: they describe the addresses
+                        // this tunnel just left. Every rotation path (429/403
+                        // recycle, watchdog, /v1/rotate, /v1/rotate/next) funnels
+                        // through here, so this is the one place that covers
+                        // them all.
+                        self.note_egress_change(old_ip_moved.as_deref(), new_ip.as_deref())
+                            .await;
 
                         new_ip
                     }
@@ -2607,6 +2657,57 @@ mod tests {
             long > short,
             "a longer retry-after must win: {long} should exceed {short}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_to_a_new_egress_drops_every_quota_verdict() {
+        // The verdict means "spent for the egresses I hold". Replacing those
+        // egresses makes it a lie about the new ones, and keeping it refuses a
+        // pool that may have recovered -- measured on production: after a
+        // rotation to fresh /64s every request was still refused from the cache
+        // in ~1ms while the upstream would have answered.
+        let pool = pool_with(2);
+        pool.note_quota_window("deepseek-v4.1-flash-free", 52_000)
+            .await;
+        pool.note_quota_window("beam-free", 52_000).await;
+        assert!(pool
+            .quota_window_remaining("deepseek-v4.1-flash-free")
+            .await
+            .is_some());
+
+        pool.note_egress_change(
+            Some("2a09:bac1:6500:8::3c1:47"),
+            Some("2a09:bac5:55fc:25c3::3c3:46"),
+        )
+        .await;
+
+        assert_eq!(
+            pool.quota_window_remaining("deepseek-v4.1-flash-free")
+                .await,
+            None,
+            "a new egress invalidates the verdict for every model, not just one"
+        );
+        assert_eq!(pool.quota_window_remaining("beam-free").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_rotation_that_keeps_the_same_egress_keeps_the_verdict() {
+        // WARP frequently hands back the address the tunnel already had. The
+        // quotas are unchanged then, so clearing would only buy a full walk
+        // whose single possible outcome is the same refusal.
+        let pool = pool_with(2);
+        pool.note_quota_window("beam-free", 52_000).await;
+        let same = Some("2a09:bac1:6500:8::3c1:47");
+
+        pool.note_egress_change(same, same).await;
+        assert!(
+            pool.quota_window_remaining("beam-free").await.is_some(),
+            "an unchanged egress must not throw the verdict away"
+        );
+
+        // An unverifiable new address is also not evidence of a change.
+        pool.note_egress_change(same, None).await;
+        assert!(pool.quota_window_remaining("beam-free").await.is_some());
     }
 
     #[tokio::test]
