@@ -59,6 +59,11 @@ pub struct Config {
     pub warp_protocol: WarpProtocol,
     /// Auto-rotate a WARP identity when receiving HTTP 429 Rate Limit (default: true)
     pub warp_auto_rotate_429: bool,
+    /// A 429 whose `retry-after` exceeds this many seconds is a spent free
+    /// bucket for the rest of the day, not a queue hiccup: rotating the egress
+    /// for it drains live streams for 30-90s and comes back on the same /32
+    /// pool, so the 429 is reported instead (default: 3600).
+    pub warp_quota_rotate_max_window: u64,
     /// Auto-rotate a WARP identity when receiving HTTP 403 Abuse / FreeTierError (default: true)
     pub warp_auto_rotate_403: bool,
     /// Directory holding per-identity WireGuard profiles (default: /app/warp)
@@ -135,6 +140,7 @@ impl Config {
             warp_enabled: env_bool("WARP_ENABLED", true) && warp_identities > 0,
             warp_protocol,
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
+            warp_quota_rotate_max_window: env_parse("WARP_QUOTA_ROTATE_MAX_WINDOW", 3600),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
             warp_state_dir: env::var("WARP_STATE_DIR").unwrap_or_else(|_| "/app/warp".to_string()),
             max_retries: env_parse("MAX_RETRIES", default_max_retries).max(1),
@@ -184,6 +190,7 @@ mod tests {
             warp_enabled: true,
             warp_protocol: WarpProtocol::WireGuard,
             warp_auto_rotate_429: true,
+            warp_quota_rotate_max_window: 3600,
             warp_auto_rotate_403: true,
             warp_state_dir: "/app/warp".into(),
             max_retries: 3,

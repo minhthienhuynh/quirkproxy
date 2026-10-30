@@ -16,7 +16,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -664,8 +664,19 @@ impl Tunnel {
                 _ = self.restart.notified() => {
                     info!("Tunnel {}: restart requested, stopping {}...", self.index, daemon_name);
                     cancelled.store(true, Ordering::Relaxed);
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    if !terminate_child(&mut child, self.index, daemon_name).await {
+                        // Without a dead child the new config would run
+                        // alongside the old one on the same port. Mark the
+                        // tunnel unhealthy and back off: the handle is dropped
+                        // when this iteration ends, and `kill_on_drop(true)`
+                        // sends one more signal before the port is retried.
+                        let mut st = self.state.lock().await;
+                        st.healthy = false;
+                        st.condition = TunnelCondition::Unhealthy;
+                        drop(st);
+                        backoff = (backoff * 2).min(TUNNEL_MAX_BACKOFF);
+                        continue;
+                    }
                     {
                         let mut st = self.state.lock().await;
                         st.healthy = false;
@@ -1460,6 +1471,56 @@ async fn restart_tunnel(tunnel: &Arc<Tunnel>) -> bool {
     false
 }
 
+/// How long to wait for a killed tunnel child to be reaped before escalating.
+///
+/// A SIGKILL to a process parked in an uninterruptible state does not produce a
+/// death: measured on this host, `usque` sat in `ep_poll` and was still alive
+/// minutes after its restart was requested. `Child::kill()` awaits that death,
+/// so an unbounded call there stalls the supervisor, the `restart_generation`
+/// the rotation is polling never advances, and — because the pool lock is held
+/// across a recycle — every later rotation queues behind it.
+const CHILD_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Stops a tunnel child and reports whether it is really gone.
+///
+/// Each step is bounded and escalates rather than waiting forever:
+/// 1. SIGKILL (what `Child::kill` sends), then reap within [`CHILD_KILL_GRACE`].
+/// 2. If it survives, signal again for a second grace window — a `usque` that
+///    was mid-handshake when the first signal landed can miss it.
+/// 3. On failure say so loudly and return `false`: the caller must back off
+///    instead of spawning a second daemon onto a port that is still bound.
+async fn terminate_child(child: &mut Child, index: usize, daemon_name: &str) -> bool {
+    for attempt in 1..=2 {
+        let _ = child.kill().await;
+        match tokio::time::timeout(CHILD_KILL_GRACE, child.wait()).await {
+            Ok(Ok(_)) => {
+                if attempt > 1 {
+                    warn!(
+                        "Tunnel {}: {} exited only after a second kill",
+                        index, daemon_name
+                    );
+                }
+                return true;
+            }
+            Ok(Err(e)) => {
+                warn!("Tunnel {}: waiting on {} failed: {}", index, daemon_name, e);
+                return false;
+            }
+            Err(_) => warn!(
+                "Tunnel {}: {} still alive {:?} after kill attempt {}/2",
+                index, daemon_name, CHILD_KILL_GRACE, attempt
+            ),
+        }
+    }
+
+    error!(
+        "Tunnel {}: {} survived two SIGKILLs; leaving it to kill_on_drop and \
+         backing off rather than binding its port twice",
+        index, daemon_name
+    );
+    false
+}
+
 /// Counts the TCP connections in `ESTABLISHED` state whose local port is
 /// `port`.
 ///
@@ -1564,6 +1625,40 @@ fn build_probe_client(port: u16) -> Option<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child that exits on SIGKILL must be reported as stopped, so the caller
+    /// knows the port is free before it spawns a replacement.
+    #[tokio::test]
+    async fn terminate_child_reports_a_killed_child_as_gone() {
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn sleep");
+        let stopped = terminate_child(&mut child, 0, "sleep").await;
+        assert!(stopped, "a SIGKILLed child must be reported as stopped");
+    }
+
+    /// The escalation path: a child that ignores SIGKILL is impossible to build
+    /// in a portable test (SIGKILL cannot be caught), so what is asserted here
+    /// is the property that made the old code hang — the call is bounded. A
+    /// child that has already been reaped must return promptly rather than
+    /// waiting out both grace windows.
+    #[tokio::test]
+    async fn terminate_child_is_bounded_when_the_child_is_already_reaped() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let _ = child.wait().await;
+
+        let started = Instant::now();
+        let stopped = terminate_child(&mut child, 0, "true").await;
+        assert!(
+            started.elapsed() < CHILD_KILL_GRACE * 2,
+            "an already-dead child must not consume the whole grace budget, took {:?}",
+            started.elapsed()
+        );
+        // Whether this reports stopped or not is platform detail; what matters
+        // is that it returned instead of blocking the supervisor.
+        let _ = stopped;
+    }
 
     fn pool_with(n: usize) -> Arc<WarpPool> {
         Arc::new(WarpPool::new(
