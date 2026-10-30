@@ -153,10 +153,16 @@ impl Config {
             warp_enabled: env_bool("WARP_ENABLED", true) && warp_identities > 0,
             warp_protocol,
             warp_auto_rotate_429: env_bool("WARP_AUTO_ROTATE_429", true),
-            // One exit per tunnel: the pool is what bounds real capacity, so
-            // letting the engine walk wider than the pool only repeats
-            // verdicts on exits already known to refuse.
-            max_anonymous_exits: env_parse::<usize>("MAX_ANONYMOUS_EXITS", warp_identities.max(1)),
+            // Default to the engine's own 8, NOT the pool size.
+            //
+            // Measured 2026-10-30 on a 10-tunnel pool, interleaved against the
+            // unmodified image: defaulting to the pool size (10) raised the mean
+            // leg count from 3.15 to 5.51 and p50 latency from 2650ms to
+            // 4625ms, because the extra exits are spent hunting for quota that
+            // is not there. Sizing it by the pool was the wrong instinct: this
+            // cap BOUNDS the walk, so a larger value is more work, not more
+            // capacity. Lowering it was worse still (3 -> 8/15 requests 429).
+            max_anonymous_exits: env_parse::<usize>("MAX_ANONYMOUS_EXITS", 8),
             free_tier_block_seconds: env_parse("FREE_TIER_BLOCK_SECONDS", 900),
             warp_quota_rotate_max_window: env_parse("WARP_QUOTA_ROTATE_MAX_WINDOW", 3600),
             warp_auto_rotate_403: env_bool("WARP_AUTO_ROTATE_403", true),
@@ -210,7 +216,7 @@ mod tests {
             warp_enabled: true,
             warp_protocol: WarpProtocol::WireGuard,
             warp_auto_rotate_429: true,
-            max_anonymous_exits: 3,
+            max_anonymous_exits: 8,
             free_tier_block_seconds: 900,
             warp_quota_rotate_max_window: 3600,
             warp_auto_rotate_403: true,

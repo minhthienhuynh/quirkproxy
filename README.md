@@ -60,7 +60,7 @@ Ultra-lightweight Rust Supervisor & Auto-Healing Reverse Proxy for **OpenCode2AP
 | `WARP_AUTO_ROTATE_429` | `true` | Recycle a tunnel on upstream `429` |
 | `WARP_AUTO_ROTATE_403` | `true` | Recycle a tunnel on a rotation-eligible `403` |
 | `MAX_RETRIES` | `1` with a multi-identity pool, else `3` | Upstream attempts per client request. Forwarded to the engine as `retry.max_attempts`; it used to configure only the supervisor's own loop. |
-| `MAX_ANONYMOUS_EXITS` | same as `WARP_IDENTITIES` | How many distinct exits one anonymous request may walk inside the engine. The engine's own default is 8 regardless of pool size, which cost up to eight legs (~5-6 s) to report a verdict the first leg already had. |
+| `MAX_ANONYMOUS_EXITS` | `8` | How many distinct exits one anonymous request may walk inside the engine. This **bounds** the walk: raising it costs legs and latency (measured 10 → mean 5.51 legs / 4625 ms vs 3.15 / 2650 ms), and lowering it turns refusals into the client's problem (3 → 8 of 15 requests `429`). |
 | `FREE_TIER_BLOCK_SECONDS` | `900` | How long an exit that answered `429` stays out of the engine's anonymous cursor, so a request cannot walk back onto it. |
 | `WARP_QUOTA_ROTATE_MAX_WINDOW` | `3600` | A `429` whose `retry-after` exceeds this many seconds is a spent daily bucket, not a queue hiccup: it is reported instead of triggering a rotation that would only drain live streams. |
 | `UPSTREAM_API` | `http://127.0.0.1:18088` | Base URL of the `opencode2api` engine |
